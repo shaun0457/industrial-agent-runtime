@@ -6,9 +6,10 @@ The owning runtime specs now define the accepted minimal contracts exactly as
 recorded below. Dependent B1 implementation may resume. This record is retained as
 implementation evidence and must not be read as an active blocker.
 
-No canonical spec has been changed. Existing state/ref/serialization/trace contracts
-can be implemented independently. Full `ModelTurn`, fake-provider action variants,
-dispatcher, and executable WorkBatch acceptance remain blocked.
+At the original report, no canonical spec had been changed and only independent
+state/ref/serialization/trace contracts were implemented. D-034 subsequently
+resolved the gaps; resumed B1 implementation is recorded in `b1-handoff.md`.
+The historical evidence below is retained for audit.
 
 ## Evidence search
 

@@ -1,66 +1,90 @@
-# B1 handoff — independent contract tranche
+﻿# B1 handoff — contracts and reference coordinator
 
-Branch: `feat/contracts-runtime-v0`.
+Branch: `feat/contracts-runtime-v0-resume`.
+Base: `83b8645`, containing approved D-034 contract closure.
 
-Status: **partial delivery; B1 exit gate blocked by SPEC_CONFLICT**.
+Status: B1 implemented with restricted, fail-closed B2/B3/B4 seams.
+No unresolved SPEC_CONFLICT. Downstream runtime phases remain unfinished.
 
 ## Changes
 
-- `pyproject.toml`, `.gitignore`: Python 3.11+ standard-library-only package scaffold.
-- `src/industrial_agent_runtime/contracts.py`: frozen generic InformationRef,
-  Budget, Task, ToolSpec/ToolResult, TaskStatus, StateDelta,
-  ModelStateUpdateProposal, ContextProjection, RuntimeResult, Subtask/SubtaskResult,
-  and TraceEvent contracts. Mutable JSON inputs are defensively copied/frozen.
-- `protocols.py`: consumer-owned `TaskStateStore` protocol with atomic
-  `apply_batch`; runtime imports no consumer state.
-- `serialization.py`: deterministic JSON conversion/checksum and rejection of
-  opaque objects/nonfinite values.
-- `trace.py`: durable single-writer append-only JSONL events; exact immutable
-  content-addressed projection artifacts; projection corruption/path validation;
-  required MODEL_TURN metadata and task/ref linkage checks.
-- `tests/test_contracts.py`: public contract, visibility, consumer protocol,
-  serialization, durable replay, immutability, and boundary tests.
-- `docs/b1-spec-conflicts.md`: evidence and minimal proposed contract decisions.
-
-All public implemented names are re-exported from `industrial_agent_runtime`.
-`Revision` is `int | str`; producer labels and domain payloads remain opaque.
-`to_jsonable` converts frozen mappings/tuples/dataclasses to plain JSON values.
+- `actions.py`: immutable D-034 ToolCallRequest, FinishProposal, ModelTurn action
+  union, TOOL/SUBTASK WorkItem and WorkBatch. Only ALL_SETTLED is accepted.
+- `provider.py`: deterministic FakeProvider scripts/factories for every action and
+  state proposal, bound to exact projection refs.
+- `hooks.py`: trusted RequestGate, Executor, ResultVerifier, ResultIngestor,
+  ModelProvider protocols and canonical GateDecision envelope.
+- `coordinator.py`: single-run loop, atomic revision-bound model updates, structured
+  feedback, TOOL waves, failure propagation, current-revision lexical ingestion,
+  lifecycle/budget counters, and complete durable event/projection tracing.
+- `__init__.py`: exports; original state/ref/store contracts remain compatible.
+- `tests/test_coordinator.py`: end-to-end fake-provider acceptance/negative paths.
+- README, this handoff, historical conflict record: current integration status.
 
 ## Verification
 
 ```powershell
 $env:PYTHONPATH = (Join-Path (Get-Location) 'src')
-py -3.13 -m unittest discover -s tests -v
+& C:/Users/chengting/AppData/Local/Programs/Python/Python313/python.exe -m unittest discover -s tests -q
 ```
 
-Result: `Ran 15 tests in 0.079s` / `OK` (exit 0).
-This is the complete current regression suite; the baseline contained no code or
-tests. Tests require no network, external provider, domain package or framework.
+Output: `Ran 52 tests in 1.528s` / `OK` (exit 0), including all 15 original
+contract/trace regressions. No network, provider SDK, domain package, LangGraph or
+MCP is needed. AST import-boundary regression passes.
 
-## Acceptance coverage and limitations
+## B1 acceptance
 
-- Implemented contracts are serializable, immutable at the JSON payload boundary,
-  and independent of all application/domain imports.
-- Consumer-owned fake store demonstrates atomic all-or-nothing multi-delta
-  application and optimistic stale-revision rejection. This validates protocol
-  usability, **not** an implemented runtime loop or a production consumer store.
-- Trace recorder persists/reopens exact projection bytes and required model/tool
-  metadata. Fixed inputs produce identical artifact/event bytes.
-- EVALUATOR refs are rejected in projection included_refs. Consumer content
-  relevance/recursive domain visibility and semantic reference resolution remain
-  consumer responsibilities; no generic semantic leakage detector is claimed.
-- No gates, Executor, real provider, subagent spawning, or mutable DAG was added.
-- Trace recorder is a single-writer per-run primitive, not crash recovery or
-  cross-process concurrency infrastructure. Checksums detect changed artifact
-  bytes; they are not an OS access-control guarantee.
-- ModelTurn action variants, fake provider, reference loop, same-turn suppression,
-  step accounting, and WorkBatch scheduling/ingestion acceptance are unimplemented
-  pending the three public-contract decisions in `b1-spec-conflicts.md`.
-- B2/B3/B4 remain downstream. No executable bypass/fallback was introduced.
+- Typed no-tool finish and all four ModelTurn actions run through FakeProvider.
+- Atomic two-delta proposal commits once before a same-turn tool gate sees the new
+  revision. Illegal/stale/malformed proposals apply nothing and suppress direct
+  tools and entire WorkBatch actions from that turn.
+- Accepted/rejected update batches use one step and zero tool calls. Dispatched
+  tools use one step and one tool call; NONE/finish use model-call budget only.
+  Step/model exhaustion stops; unsupported token-metered execution fails before
+  provider calls, rather than treating approximate tokens as actual usage.
+- Batches validate unique IDs, dependencies, cycles, cumulative standard budgets,
+  ALL_SETTLED and recursive hidden ref envelopes before scheduling. A later hidden
+  EVALUATOR ref prevents even the first otherwise legal work item from dispatching.
+- Failed items propagate SKIPPED_DEPENDENCY without retries; independent successful
+  results still ingest. The OQ-3 permitted sequential Executor collects a complete
+  ready wave before lexical work_id ingestion. Gate revisions [0, 0, 2] versus
+  ingestion revisions [0, 1, 2] prove current-revision rebinding.
+- Consumer fake TaskStateStore implements atomic optimistic validation; runtime
+  imports no consumer class. Model producer becomes MODEL; ingestion producer
+  becomes RESULT_INGESTION before consumer validation.
+- Exact saved projections contain task_state plus runtime_feedback. Every model
+  call records provider/model/version/prompt/tool metadata. Complete turns,
+  proposals, raw tool results, verified deltas and resulting revisions persist in
+  JSONL. A fixed clock, tools and script produce identical trace bytes.
+- Missing hooks, unknown tools, schema/consumer denial, unknown result/final refs,
+  hidden refs, verifier exceptions and unexpected actual resource use fail closed.
 
-## Integration
+## Integration and downstream limits
 
-Pin this branch commit for independent lab imports of InformationRef,
-ContextProjection, StateDelta, TaskStateStore and JSON helpers. Do not advertise
-this package as a completed B1 runtime or start dependent execution tests until
-the owning contracts are adjudicated and the blocked slice is completed.
+- Coordinator requires an unused trace directory and runs once. Trusted hooks are
+  application code, never model-authored callbacks. No allow-all default exists.
+- `generate(..., limits)` receives exact context_projection_ref, immutable Budget
+  and copied usage. Fake factories use that ref to bind fresh typed turns.
+- B1 permits READ/COMPUTE with zero declared/reserved extra draw only. Gate output
+  must explicitly ALLOW the exact request at the current revision. Approval,
+  unbound revision and unsupported normalization/reservation deny execution.
+- Full JSON-schema and consumer-condition checks remain the mandatory per-request
+  gate responsibility immediately before dispatch (B2). Generic batch preflight
+  only inspects structural/ref-envelope visibility; semantic or string-reference
+  resolution belongs to the consumer. No new batch gate interface was invented.
+- Post-result schema/ref/provenance/ingestion invariants and finish structural
+  readiness remain mandatory trusted verifier responsibilities (B3). Tests supply
+  deterministic fixture validators, not production domain policies.
+- SIMULATE/PROPOSE/MUTATE/ADMIN, compound resource reservation/accounting,
+  token-metered providers and SUBTASK spawning remain disabled pending B2-B5.
+  Configured extra dimensions are preserved and never silently spent.
+- Successful ToolResult status in this adapter is SUCCESS. Other statuses do not
+  ingest. RuntimeResult owns coordinator lifecycle; consumer stores own their
+  application status and legal delta operations.
+- Trace is single-writer audit persistence, not checkpoint/resume. Executor hooks
+  own adapter timeout/resource enforcement. No shell, background worker, mutable
+  graph, domain code or provider network access was added.
+
+Coordinator independent review requested generic whole-batch hidden-ref preflight
+and a finish-verifier exception regression. Both are implemented and included in
+this verification. Commit SHA is supplied separately in the task handoff.
