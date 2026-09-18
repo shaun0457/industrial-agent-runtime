@@ -129,7 +129,17 @@ A compound tool must expose the resource dimensions it can consume. If one call 
 
 ### `ToolCallRequest`
 
-Model-produced typed request. Parse/schema validity never grants execution authority.
+```text
+ToolCallRequest
+  request_id: string
+  tool_name: string
+  arguments: JSON object
+```
+
+This is a model-produced typed request. `tool_name` selects one registered
+`ToolSpec`; `arguments` is validated against that tool's input schema. The request
+contains no execution authority: parse/schema validity never grants permission,
+budget, side-effect authority, or dispatch.
 
 ### `ToolResult`
 
@@ -249,6 +259,20 @@ Processing order is deterministic:
 ```
 
 This allows the Agent to externalize a newly formed hypothesis/evidence link before requesting work that references it, without requiring a separate model call.
+
+### `FinishProposal`
+
+```text
+FinishProposal
+  structured_output: JSON value
+  information_refs[]
+  artifact_refs[]
+```
+
+The proposal is model output, not a status transition. Runtime and consumer
+structural readiness checks validate the output schema and every cited ref before
+the generic task status may become `READY`/`DONE`. Missing, unknown, hidden, or
+inconsistent refs reject the proposal with structured feedback.
 
 ### `ContextProjection`
 

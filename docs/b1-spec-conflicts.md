@@ -1,6 +1,10 @@
 # B1 public-contract gaps
 
-Status: **SPEC_CONFLICT — dependent implementation stopped; awaiting adjudication**.
+Status: **RESOLVED — accepted as D-034 on 2026-09-18**.
+
+The owning runtime specs now define the accepted minimal contracts exactly as
+recorded below. Dependent B1 implementation may resume. This record is retained as
+implementation evidence and must not be read as an active blocker.
 
 No canonical spec has been changed. Existing state/ref/serialization/trace contracts
 can be implemented independently. Full `ModelTurn`, fake-provider action variants,
@@ -31,7 +35,7 @@ request payload. No alternate owning definition was found.
   tool and its arguments, while the frozen public request has no names or types
   for these fields. Choosing `tool` versus `tool_name` or a nested operation
   envelope in code would silently create the public wire contract.
-- Smallest proposed change (not implemented): define
+- Accepted smallest change: define
   `{request_id: string, tool_name: string, arguments: JSON object}` and explicitly
   state that model-produced fields contain no execution authority.
 
@@ -44,7 +48,7 @@ request payload. No alternate owning definition was found.
   refer to `FinishProposal`, without a field definition.
 - Conflicting assumptions: a typed final-output verifier needs the proposed
   output plus reference set, but no generic representation is prescribed.
-- Smallest proposed change (not implemented): define
+- Accepted smallest change: define
   `{structured_output: JSON value, information_refs: InformationRef[],
   artifact_refs: InformationRef[]}`; readiness remains consumer-defined.
 
@@ -56,12 +60,11 @@ request payload. No alternate owning definition was found.
   dependencies and skipped dependents but do not define the policy field.
 - Conflicting assumptions: accepting any value gives unknown model output
   meaning; ignoring it could execute work contrary to requested policy.
-- Smallest proposed change (not implemented): v0 supports only `ALL_SETTLED`,
+- Accepted smallest change: v0 supports only `ALL_SETTLED`,
   using the existing failure/dependency rules; unknown values are denied.
 
 ## Resume gate
 
-After an explicit contract decision updates the owning specs (and any decision
-record required by the coordinator), implement the blocked models and loop,
-then run the original B1 acceptance criteria. This partial contract tranche is
-not a completed B1 and is not an execution-authorized runtime.
+D-034 and the owning spec updates satisfy the resume gate. Implement the blocked
+models and loop, then run the original B1 acceptance criteria. The earlier partial
+contract tranche alone remains non-execution-authorized.

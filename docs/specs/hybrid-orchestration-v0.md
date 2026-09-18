@@ -238,8 +238,15 @@ WorkBatch
   objective
   items[]
   budget_request
-  completion_policy
+  completion_policy: ALL_SETTLED
 ```
+
+v0 supports exactly one completion policy: `ALL_SETTLED`. The Coordinator runs
+dependency-ready work until every item is terminal as `COMPLETED`, `FAILED`, or
+`SKIPPED_DEPENDENCY`, deterministically ingests every verified successful result,
+and then returns the compact batch outcome to the next Main Agent turn. Existing
+dependency-failure propagation and no-silent-retry rules still apply. An unknown
+completion policy is rejected before any item executes.
 
 ### `WorkItem`
 
