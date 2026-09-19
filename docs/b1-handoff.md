@@ -28,9 +28,10 @@ $env:PYTHONPATH = (Join-Path (Get-Location) 'src')
 & C:/Users/chengting/AppData/Local/Programs/Python/Python313/python.exe -m unittest discover -s tests -q
 ```
 
-Output: `Ran 52 tests in 1.528s` / `OK` (exit 0), including all 15 original
+Output after the approved lifecycle fix: `Ran 62 tests in 1.870s` / `OK` (exit 0), including all 15 original
 contract/trace regressions. No network, provider SDK, domain package, LangGraph or
 MCP is needed. AST import-boundary regression passes.
+`python -m compileall -q src tests` and `git diff --check` also pass.
 
 ## B1 acceptance
 
@@ -79,8 +80,9 @@ MCP is needed. AST import-boundary regression passes.
   token-metered providers and SUBTASK spawning remain disabled pending B2-B5.
   Configured extra dimensions are preserved and never silently spent.
 - Successful ToolResult status in this adapter is SUCCESS. Other statuses do not
-  ingest. RuntimeResult owns coordinator lifecycle; consumer stores own their
-  application status and legal delta operations.
+  ingest. Coordinator persists generic terminal lifecycle through the consumer's
+  new `TaskStateStore.transition_status(status, expected_revision)` protocol;
+  consumer-specific state operation names are never imported or hardcoded.
 - Trace is single-writer audit persistence, not checkpoint/resume. Executor hooks
   own adapter timeout/resource enforcement. No shell, background worker, mutable
   graph, domain code or provider network access was added.
@@ -88,3 +90,20 @@ MCP is needed. AST import-boundary regression passes.
 Coordinator independent review requested generic whole-batch hidden-ref preflight
 and a finish-verifier exception regression. Both are implemented and included in
 this verification. Commit SHA is supplied separately in the task handoff.
+
+## Approved lifecycle persistence fix
+
+The owning runtime-v0 spec now defines the atomic optimistic `transition_status`
+contract. Verified finish, budget exhaustion and runtime failure persist DONE,
+EXHAUSTED and FAILED with a new revision; no work budget is consumed. Already
+terminal stores avoid provider calls, and same-terminal persistence is idempotent.
+Different-terminal replacement and stale expected revisions reject without mutation.
+
+Coordinator checks the returned revision against the store's actual status/revision
+and traces each transition. A transition exception or postcondition mismatch clears
+successful output and yields runtime FAILED with STATUS_PERSISTENCE_FAILED evidence.
+It does not retry or falsely claim the store persisted FAILED; observed store status
+and revision remain explicit. Regression tests cover all terminal paths, no-op and
+stale cases, exceptions, wrong return/status/revision behavior and terminal races.
+Consumer fixtures were updated; downstream consumers must implement the new method.
+No B2/B4 capabilities or domain-specific operation names were added.

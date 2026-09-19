@@ -129,7 +129,7 @@ class CoordinatorTests(unittest.TestCase):
                                            tool_request=request(note_key="hypothesis")), finish()])
         self.assertEqual(result.status, TaskStatus.DONE)
         self.assertEqual(self.gate.revisions, [1])
-        self.assertEqual(self.store.revision(), 2)
+        self.assertEqual(self.store.revision(), 3)  # proposal + ingestion + DONE
         self.assertEqual(result.budget_usage["steps"], 2)
         self.assertEqual(result.budget_usage["tool_calls"], 1)
 
@@ -154,7 +154,7 @@ class CoordinatorTests(unittest.TestCase):
             work_batch=WorkBatch("batch", "work", (item("a"),))), finish()])
         self.assertEqual(self.executor.calls, [])
         self.assertEqual(result.budget_usage["steps"], 1)
-        self.assertEqual(self.store.revision(), 0)
+        self.assertEqual(self.store.revision(), 1)  # only the verified DONE transition
 
     def test_missing_delta_revision_suppresses_tool(self):
         update = ModelStateUpdateProposal("u1", 0, (StateDelta("SET_NOTE", "a", 1, "MODEL"),))
@@ -203,7 +203,7 @@ class CoordinatorTests(unittest.TestCase):
         events = [e for e in self.trace.read_events() if e["type"] == "RESULT_INGESTION"]
         self.assertEqual([e["input_summary"]["expected_revision"] for e in events], [0, 1, 2])
         self.assertEqual([e["work_id"] for e in events], ["a", "z", "c"])
-        self.assertEqual(result.state_revision, 3)
+        self.assertEqual(result.state_revision, 4)  # three ingestions + DONE
         self.assertEqual(result.budget_usage["tool_calls"], 3)
 
     def test_failed_dependency_skips_transitively_without_retry(self):
@@ -404,6 +404,102 @@ class CoordinatorTests(unittest.TestCase):
             self.gate, self.executor, self.verifier = Gate(self.store), Execute(), Verify()
             self.run_script(script)
             self.assertEqual(first, self.trace.events_path.read_bytes())
+
+    def test_verified_finish_persists_done_revision_and_trace_without_step_charge(self):
+        result = self.run_script([finish()])
+        self.assertEqual((result.status, self.store.status()), (TaskStatus.DONE, TaskStatus.DONE))
+        self.assertEqual((result.state_revision, self.store.revision()), (1, 1))
+        self.assertEqual(result.budget_usage["steps"], 0)
+        event = next(e for e in self.trace.read_events() if e["type"] == "STATUS_TRANSITION")
+        self.assertEqual(event["status"], "ACCEPTED")
+        self.assertEqual(event["input_summary"]["expected_revision"], 0)
+        self.assertEqual(event["output_summary"]["resulting_revision"], 1)
+        self.assertEqual(event["output_summary"]["resulting_status"], "DONE")
+
+    def test_exhaustion_persists_even_with_zero_remaining_work_budget(self):
+        self.task = replace(self.task, budget=Budget(0, 0, 0, 0, 0))
+        result = self.run_script([])
+        self.assertEqual(result.status, TaskStatus.EXHAUSTED)
+        self.assertEqual(self.store.status(), TaskStatus.EXHAUSTED)
+        self.assertEqual(result.state_revision, 1)
+        self.assertEqual(result.budget_usage["steps"], 0)
+        self.assertEqual(self.provider.projections, [])
+
+    def test_provider_failure_persists_failed_status_and_revision(self):
+        result = self.run_script([])
+        self.assertEqual((result.status, self.store.status()), (TaskStatus.FAILED, TaskStatus.FAILED))
+        self.assertEqual(result.state_revision, 1)
+        self.assertIsNone(result.structured_output)
+
+    def test_status_persistence_exception_clears_output_and_never_retries(self):
+        calls = []
+        def reject(status, expected_revision):
+            calls.append((status, expected_revision))
+            raise RuntimeError("fixture storage unavailable")
+        self.store.transition_status = reject
+        result = self.run_script([finish()])
+        self.assertEqual(calls, [(TaskStatus.DONE, 0)])
+        self.assertEqual(result.status, TaskStatus.FAILED)
+        self.assertIsNone(result.structured_output)
+        self.assertEqual((self.store.status(), result.state_revision), (TaskStatus.RUNNING, 0))
+        self.assertIn("STATUS_PERSISTENCE_FAILED", result.errors[0])
+        event = next(e for e in self.trace.read_events() if e["type"] == "STATUS_TRANSITION")
+        self.assertEqual(event["status"], "DENIED")
+        self.assertEqual(event["output_summary"]["observed_status"], "RUNNING")
+        self.assertEqual(event["output_summary"]["observed_revision"], 0)
+
+    def test_status_persistence_wrong_return_revision_fails_closed_with_actual_state(self):
+        original = self.store.transition_status
+        def inconsistent(status, expected_revision):
+            return original(status, expected_revision) + 1
+        self.store.transition_status = inconsistent
+        result = self.run_script([finish()])
+        self.assertEqual(result.status, TaskStatus.FAILED)
+        self.assertEqual(result.state_revision, 1)
+        self.assertEqual(self.store.status(), TaskStatus.DONE)
+        self.assertIsNone(result.structured_output)
+        self.assertIn("inconsistent status/revision", result.errors[0])
+
+    def test_status_persistence_wrong_status_fails_closed(self):
+        def wrong_status(status, expected_revision):
+            self.store.current += 1
+            return self.store.current
+        self.store.transition_status = wrong_status
+        result = self.run_script([finish()])
+        self.assertEqual(result.status, TaskStatus.FAILED)
+        self.assertEqual(self.store.status(), TaskStatus.RUNNING)
+        self.assertIsNone(result.structured_output)
+
+    def test_status_change_without_new_revision_fails_closed(self):
+        def no_revision(status, expected_revision):
+            self.store.lifecycle = status
+            return self.store.current
+        self.store.transition_status = no_revision
+        result = self.run_script([finish()])
+        self.assertEqual(result.status, TaskStatus.FAILED)
+        self.assertEqual(result.state_revision, 0)
+        self.assertIn("revision advancement", result.errors[0])
+
+    def test_already_cancelled_store_is_observed_without_provider_or_revision_change(self):
+        self.store.transition_status(TaskStatus.CANCELLED, 0)
+        result = self.run_script([])
+        self.assertEqual(result.status, TaskStatus.CANCELLED)
+        self.assertEqual(result.state_revision, 1)
+        self.assertEqual(self.provider.projections, [])
+        self.assertEqual(result.budget_usage["model_calls"], 0)
+
+    def test_terminal_race_is_not_overwritten_or_retried(self):
+        original = self.verifier.verify_finish
+        def cancel_during_finish(*args):
+            accepted = original(*args)
+            self.store.transition_status(TaskStatus.CANCELLED, self.store.revision())
+            return accepted
+        self.verifier.verify_finish = cancel_during_finish
+        result = self.run_script([finish()])
+        self.assertEqual(result.status, TaskStatus.FAILED)
+        self.assertEqual(self.store.status(), TaskStatus.CANCELLED)
+        self.assertEqual(result.state_revision, 1)
+        self.assertIsNone(result.structured_output)
 
 
 class ActionContractTests(unittest.TestCase):

@@ -31,12 +31,24 @@ class ConsumerStore:
     def __init__(self):
         self.data = {}
         self.current = 0
+        self.lifecycle = TaskStatus.RUNNING
 
     def revision(self):
         return self.current
 
     def status(self):
-        return TaskStatus.RUNNING
+        return self.lifecycle
+
+    def transition_status(self, status, expected_revision):
+        terminal = {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.EXHAUSTED, TaskStatus.CANCELLED}
+        if expected_revision != self.current:
+            raise ValueError("stale")
+        if status not in terminal or (self.lifecycle in terminal and self.lifecycle != status):
+            raise ValueError("illegal terminal transition")
+        if self.lifecycle != status:
+            self.lifecycle = status
+            self.current += 1
+        return self.current
 
     def project(self, policy):
         return replace(projection(self.data), base_revision=self.current)
@@ -112,6 +124,21 @@ class ContractTests(unittest.TestCase):
                   StateDelta("SET_NOTE", "b", 2, "MODEL", 0))
         self.assertEqual(store.apply_batch(deltas, 0), 1)
         self.assertEqual(store.data, {"a": 1, "b": 2})
+
+    def test_consumer_status_transition_is_atomic_stale_checked_and_terminal_only(self):
+        store = ConsumerStore()
+        for status, revision in ((TaskStatus.DONE, -1), (TaskStatus.RUNNING, 0)):
+            with self.assertRaises(ValueError):
+                store.transition_status(status, revision)
+            self.assertEqual((store.status(), store.revision()), (TaskStatus.RUNNING, 0))
+        self.assertEqual(store.transition_status(TaskStatus.DONE, 0), 1)
+        self.assertEqual(store.transition_status(TaskStatus.DONE, 1), 1)
+        with self.assertRaises(ValueError):
+            store.transition_status(TaskStatus.DONE, 0)
+        with self.assertRaises(ValueError):
+            store.transition_status(TaskStatus.FAILED, 1)
+        self.assertEqual((store.status(), store.revision()), (TaskStatus.DONE, 1))
+        self.assertEqual(store.data, {})
 
     def test_consumer_protocol_illegal_batch_rolls_back_and_stale_rejects(self):
         store = ConsumerStore()

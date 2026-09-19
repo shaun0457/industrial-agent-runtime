@@ -25,6 +25,10 @@ class Denied(ValueError):
     """An auditable deterministic rejection, never an execution retry signal."""
 
 
+TERMINAL_STATUSES = frozenset({TaskStatus.DONE, TaskStatus.FAILED,
+                             TaskStatus.EXHAUSTED, TaskStatus.CANCELLED})
+
+
 def _has_hidden_ref(value: Any) -> bool:
     """Inspect JSON ref envelopes; semantic/string-ref resolution belongs to B2."""
     if isinstance(value, Mapping):
@@ -314,11 +318,13 @@ class Coordinator:
         output = None
         errors: list[str] = []
         self._event("TASK", "RUNNING", inputs=self.task)
-        if self.task.budget.max_total_tokens is not None:
+        if self.store.status() in TERMINAL_STATUSES:
+            self.status = self.store.status()
+        elif self.task.budget.max_total_tokens is not None:
             self.status = TaskStatus.FAILED
             errors.append("token-metered provider execution requires downstream accounting")
         while self.status == TaskStatus.RUNNING:
-            if self.store.status() in {TaskStatus.CANCELLED, TaskStatus.FAILED, TaskStatus.EXHAUSTED}:
+            if self.store.status() in TERMINAL_STATUSES:
                 self.status = self.store.status()
                 break
             if self._remaining("model_calls") <= 0 or self._remaining("steps") <= 0:
@@ -379,6 +385,10 @@ class Coordinator:
                 self.status = TaskStatus.FAILED
                 errors.append(str(exc))
                 self._event("TASK_FAILURE", "FAILED", outputs={"error": str(exc)})
+        persistence_error = self._persist_terminal_status()
+        if persistence_error is not None:
+            self.status, output = TaskStatus.FAILED, None
+            errors.append(persistence_error)
         self._event("TASK", self.status.value, outputs={
             "state_revision": self.store.revision(), "budget_usage": self.usage, "errors": errors})
         payload = self.trace.events_path.read_bytes()
@@ -386,3 +396,29 @@ class Coordinator:
                                    Visibility.INTERNAL, self.clock(), hashlib.sha256(payload).hexdigest())
         return RuntimeResult(self.task.task_id, self.status, output, self.store.revision(),
                              trace_ref, self.usage, errors=tuple(errors))
+
+    def _persist_terminal_status(self) -> str | None:
+        requested = self.status
+        revision = self.store.revision()
+        prior_status = self.store.status()
+        inputs = {"requested_status": requested, "expected_revision": revision,
+                  "prior_status": prior_status}
+        try:
+            if requested not in TERMINAL_STATUSES:
+                raise Denied("only terminal statuses may be persisted here")
+            returned = self.store.transition_status(requested, expected_revision=revision)
+            observed_revision, observed_status = self.store.revision(), self.store.status()
+            if (type(returned) not in (int, str) or returned != observed_revision
+                    or observed_status != requested):
+                raise Denied("status transition returned inconsistent status/revision")
+            if (returned == revision) != (prior_status == requested):
+                raise Denied("status transition violated revision advancement/no-op semantics")
+        except Exception as exc:
+            error = f"STATUS_PERSISTENCE_FAILED: {exc}"
+            self._event("STATUS_TRANSITION", "DENIED", inputs=inputs, outputs={
+                "observed_status": self.store.status(), "observed_revision": self.store.revision(),
+                "error": error})
+            return error
+        self._event("STATUS_TRANSITION", "ACCEPTED", inputs=inputs, outputs={
+            "resulting_status": observed_status, "resulting_revision": observed_revision})
+        return None
