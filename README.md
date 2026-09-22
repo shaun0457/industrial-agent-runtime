@@ -2,6 +2,26 @@
 
 Domain-independent control plane for one goal-driven Main Agent using typed tools, explicit typed state updates, deterministic authority gates, consumer-owned state adapters, dependency-aware work, and bounded ephemeral subagents.
 
+## Implemented B1 reference
+
+The `industrial_agent_runtime` Python package implements D-034 typed action
+contracts, `FakeProvider`, `Coordinator`, atomic state-update routing, deterministic
+TOOL WorkBatch waves and durable projection/state tracing. Public classes are
+exported from the package root. See [B1 handoff](docs/b1-handoff.md) for acceptance
+coverage and hook obligations.
+
+The coordinator has no default execution authority. Trusted request gate,
+Executor, result verifier and ingestion hooks are required for READ/COMPUTE tools.
+Other side-effect classes, resource-consuming tools and SUBTASK execution remain
+disabled until downstream integration. No external runtime dependencies are needed.
+
+Run the complete offline suite from this repository:
+
+```powershell
+$env:PYTHONPATH = (Join-Path (Get-Location) 'src')
+py -3.13 -m unittest discover -s tests -v
+```
+
 ## Purpose
 
 Provide reusable Agent runtime mechanics without embedding TEP, process safety, RCA/HAZOP semantics, or scientific-library implementations.
