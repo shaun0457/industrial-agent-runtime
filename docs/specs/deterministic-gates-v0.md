@@ -235,3 +235,44 @@ There is no automatic retry loop. A retry/replan is a new explicit request and c
 10. Consumer denial cannot be overridden by another model message.
 11. Child requesting parent-only authority is denied.
 12. A ModelStateUpdateProposal is routed to TaskStateStore validation, consumes no tool-call budget, and cannot alter runtime budget/policy/authority fields.
+
+## B2 implementation notes (v0)
+
+Implemented in `industrial_agent_runtime.gates` (pipeline), `schema` (G0 subset), and
+the `Coordinator` dispatch path. No frozen public contract was changed; the B1
+`RequestGate.validate_request` signature is kept as the consumer hook (D-012).
+
+- **Task policy.** `Task` has no side-effect/tag grant fields, so the trusted
+  application passes a `GatePolicy` to the `Coordinator` (never model-authored).
+  The default grants READ/COMPUTE only. ADMIN cannot be granted in v0 and MUTATE
+  always requires approval. Child policies exist only through `delegate`, and each
+  one must be a subset of its parent's tools, classes, and tags. A child task
+  without a delegated policy is denied at G1.
+- **G0.** A dependency-free JSON Schema subset. Unsupported keywords deny;
+  they are never ignored. Every `InformationRef`-shaped argument (any mapping
+  with `ref_id`) must parse, be AGENT-visible, and exactly match a ref known to
+  the run: an Agent-visible task context ref or a ref from a verified result.
+- **G2.** Standard `tool_calls`/`steps` plus configured `Budget.extra_dimensions`.
+  A numeric `declared_budget_draw` is reserved as-is (≤ `max_budget_draw`). The
+  runtime does not interpret string (expression) draws in v0: they reserve
+  `max_budget_draw` and are unreservable without it. Tools cannot declare
+  runtime-charged standard dimensions. WorkBatch preflight checks the cumulative
+  reservation of all items before any dispatch.
+- **Reconciliation.** After execution, actual draw is charged, not the
+  reservation. Over-draw, unreported reserved dimensions, unreserved dimensions,
+  or invalid values are violations. A violating result is charged at least its
+  reservation and is never ingested. An adapter exception is charged the full
+  reservation.
+- **G3 / compound SIMULATE.** Which extra dimensions represent simulation work is
+  consumer configuration (`GatePolicy.simulation_dimensions`). A tool drawing them
+  must be SIMULATE. A SIMULATE tool must declare an isolation guarantee and
+  reserve a positive simulation draw. SIMULATE/PROPOSE/MUTATE require a consumer
+  `ReferenceStateGuard`. If a non-MUTATE execution changes the reference
+  revision, the run fails closed.
+- **MUTATE binding / approval (OQ-5 minimal surface).** The frozen request binds
+  the task-state revision, the reference revision, the ToolSpec checksum, and the
+  reservation. `ApprovalHook.decide(frozen)` returns APPROVE or DENY; if no hook
+  is configured, the request is denied. Immediately before dispatch, a changed
+  spec, task-state revision, or (MUTATE) reference revision is rejected.
+- Consumer `normalized_request_ref` is unsupported in v0 (the exact request
+  is dispatched), and a consumer reservation must equal the runtime reservation.
