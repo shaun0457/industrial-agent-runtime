@@ -129,7 +129,17 @@ A compound tool must expose the resource dimensions it can consume. If one call 
 
 ### `ToolCallRequest`
 
-Model-produced typed request. Parse/schema validity never grants execution authority.
+```text
+ToolCallRequest
+  request_id: string
+  tool_name: string
+  arguments: JSON object
+```
+
+This is a model-produced typed request. `tool_name` selects one registered
+`ToolSpec`; `arguments` is validated against that tool's input schema. The request
+contains no execution authority: parse/schema validity never grants permission,
+budget, side-effect authority, or dispatch.
 
 ### `ToolResult`
 
@@ -250,6 +260,20 @@ Processing order is deterministic:
 
 This allows the Agent to externalize a newly formed hypothesis/evidence link before requesting work that references it, without requiring a separate model call.
 
+### `FinishProposal`
+
+```text
+FinishProposal
+  structured_output: JSON value
+  information_refs[]
+  artifact_refs[]
+```
+
+The proposal is model output, not a status transition. Runtime and consumer
+structural readiness checks validate the output schema and every cited ref before
+the generic task status may become `READY`/`DONE`. Missing, unknown, hidden, or
+inconsistent refs reject the proposal with structured feedback.
+
 ### `ContextProjection`
 
 Exact model-visible input must be materialized as an immutable, addressable artifact/ref.
@@ -277,6 +301,7 @@ revision() -> Revision
 status() -> TaskStatus
 project(policy) -> ContextProjection
 apply_batch(deltas[], expected_revision) -> NewRevision
+transition_status(status, expected_revision) -> NewRevision
 ```
 
 A consumer MAY expose `apply(delta, expected_revision)` as a convenience wrapper around a single-element batch, but `apply_batch` defines the atomic semantics for model-proposed multi-delta updates.
@@ -288,6 +313,45 @@ Required properties:
 - deterministic rejection of illegal/stale deltas;
 - domain field/operation validation remains in consumer implementation;
 - runtime depends only on this interface, never the consumer state class.
+
+### Runtime-owned terminal status persistence
+
+`transition_status(status, expected_revision)` is the generic deterministic
+Coordinator path for persisting `DONE`, `FAILED`, `EXHAUSTED`, or `CANCELLED`.
+It is not a tool or a model-authored StateDelta operation. The model cannot call
+this method or grant itself lifecycle authority. Consumer adapters implement the
+storage operation; the Coordinator owns the decision to transition.
+
+Required semantics:
+
+- Check the exact expected revision before any mutation. A stale/illegal request
+  rejects atomically without changing status, content, or revision.
+- From a nonterminal status, atomically persist the requested terminal status and
+  a new revision. Return that revision. Domain investigation content is unchanged.
+- A request for the already-persisted terminal status is an idempotent no-op and
+  returns the unchanged revision after the optimistic revision check.
+- A terminal status cannot be replaced by a different terminal status. Reuse or
+  restart is a new task/run, not a lifecycle overwrite.
+- The Coordinator persists DONE only after a verified FinishProposal; it persists
+  EXHAUSTED on hard budget termination and FAILED on runtime failure. An already
+  terminal store is observed without making another model call. Cancellation,
+  when supplied by a higher-authority caller, follows the same persistence rule.
+- After transition, the Coordinator verifies that the returned revision equals
+  `revision()` and `status()` equals the requested status. A changed status must
+  have a changed revision; an idempotent no-op must retain its revision.
+- Trace the requested status, expected revision, accepted/denied disposition and
+  observed resulting status/revision. Lifecycle persistence uses no model/tool
+  calls or additional step budget, including when work budget is exhausted.
+- If persistence fails or postconditions disagree, stop fail-closed: return a
+  runtime FAILED result with no successful structured output and an explicit
+  `STATUS_PERSISTENCE_FAILED` error. Record the observed store status/revision;
+  do not claim a successful durable transition, retry automatically, or overwrite
+  another terminal state. The store may remain nonterminal if its transition
+  rejected; this discrepancy must remain explicit in trace/result errors.
+
+`RuntimeResult.state_revision` references the observed revision after this path,
+including the terminal transition when successful. Generic lifecycle persistence
+must not be implemented through a consumer-specific operation name in core.
 
 ### `RuntimeResult`
 
@@ -465,6 +529,14 @@ MCP is not a runtime dependency. A future adapter may register MCP-provided tool
 12. Parent spawns one valid child and receives only `SubtaskResult`.
 13. Post-execution verifier rejects a final result referencing a nonexistent artifact/ref.
 14. Core package imports no TEP/domain, LangGraph, or MCP requirement.
+15. Verified finish, hard budget exhaustion, and runtime failure persist DONE,
+    EXHAUSTED, and FAILED respectively through `transition_status`; result revision
+    includes that atomic transition.
+16. An already terminal store is observed without a provider call; same-terminal
+    transition is idempotent, stale or different-terminal transitions reject.
+17. A transition exception or inconsistent returned revision/store status produces
+    runtime FAILED with cleared output and explicit STATUS_PERSISTENCE_FAILED
+    trace/result evidence, without retrying or claiming persistence succeeded.
 
 ## Non-goals
 
