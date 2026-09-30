@@ -31,11 +31,15 @@ and 3.13. No domain, LangGraph, or MCP import.
 B3 output-schema/ref/provenance verification beyond reconciliation, B4 SUBTASK
 execution, token metering, parallel executor, a UI or provider approval surface.
 
-## Contract gaps resolved conservatively (flagged for review, not blocking)
+## Contract gaps — adjudicated at Batch-2 review closure
 
-1. Task policy fields (class/tag grants) are undefined, so a trusted
-   `GatePolicy` is used; `Task` is unchanged.
-2. The `declared_budget_draw` expression grammar is undefined, so expressions
-   reserve `max_budget_draw` and are otherwise denied.
-3. GateDecision has one `expected_state_revision`, so the MUTATE reference
-   revision is carried on `FrozenRequest.expected_reference_revision`.
+The three gaps flagged earlier are now accepted decisions, recorded in the spec
+("Accepted Batch-2 decisions") and the program Decision Register:
+
+1. D-036: `GatePolicy` stays separate from `Task`; effective authority is their
+   intersection; child policies only narrow / tighten approval and inherit
+   `simulation_dimensions` unchanged (now enforced).
+2. D-037: no expression language; dynamic draws reserve `max_budget_draw`, missing
+   maximum is `UNRESERVABLE_DRAW`, actual usage is reconciled.
+3. D-038: task-state and reference-world revisions are separate fields on
+   `FrozenRequest`; MUTATE binds and re-checks both before dispatch.

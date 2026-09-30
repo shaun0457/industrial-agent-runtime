@@ -59,9 +59,12 @@ class ApprovalHook(Protocol):
 
 @dataclass(frozen=True)
 class GatePolicy:
-    """Trusted application-supplied task policy. Never model-authored.
+    """Trusted application-supplied execution authority. Never model-authored.
 
-    Child policies are created only through ``delegate`` and are strict subsets.
+    Separate from ``Task`` (requested work/tool surface); effective authority is the
+    intersection of Task permissions and these grants. Child policies are created
+    only through ``delegate``: tools/classes/tags may only narrow, approval may only
+    become stricter, and ``simulation_dimensions`` are inherited unchanged.
     """
 
     policy_version: str
@@ -100,9 +103,11 @@ class GatePolicy:
             if (not classes <= parent.granted_side_effect_classes
                     or not self.granted_policy_tags <= parent.granted_policy_tags
                     or not self.tool_allowlist <= parent.tool_allowlist
-                    or not parent.simulation_dimensions <= self.simulation_dimensions
                     or not parent.approval_required_for <= approval):
                 raise ValueError("child authority must be a subset of parent authority")
+            # Classification semantics, not authority: inherited unchanged in v0.
+            if self.simulation_dimensions != parent.simulation_dimensions:
+                raise ValueError("child policy must inherit simulation_dimensions unchanged")
 
     def delegate(self, policy_version: str, *, tools: frozenset[str],
                  classes: frozenset[SideEffectClass] | None = None,
@@ -382,6 +387,9 @@ class GatePipeline:
             self._deny(request_id, GateStage.DISPATCH, "STALE_STATE_REVISION",
                        "task state changed after authorization")
         if frozen.side_effect_class == SideEffectClass.MUTATE:
+            if self.reference_guard is None or frozen.expected_reference_revision is None:
+                self._deny(request_id, GateStage.DISPATCH, "REFERENCE_REVISION_UNBOUND",
+                           "MUTATE requires a bound reference-world revision")
             current = self.reference_guard.reference_revision()
             if current != frozen.expected_reference_revision:
                 self._deny(request_id, GateStage.DISPATCH, "STALE_REFERENCE_REVISION",

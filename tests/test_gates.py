@@ -5,10 +5,10 @@ import tempfile
 import unittest
 
 from industrial_agent_runtime import (
-    Action, Budget, Coordinator, FakeProvider, FrozenRequest, GateDecision, GatePolicy,
-    InformationRef, ModelStateUpdateProposal, SideEffectClass, StateDelta, Task,
-    TaskStatus, ToolCallRequest, ToolSpec, TraceRecorder, Visibility, WorkBatch, WorkItem,
-    reconcile, to_jsonable,
+    Action, Budget, Coordinator, FakeProvider, FrozenRequest, GateDecision, GateDenied,
+    GatePipeline, GatePolicy, InformationRef, ModelStateUpdateProposal, SideEffectClass,
+    StateDelta, Task, TaskStatus, ToolCallRequest, ToolSpec, TraceRecorder, Visibility,
+    WorkBatch, WorkItem, checksum, reconcile, to_jsonable,
 )
 from industrial_agent_runtime.schema import instance_errors, schema_errors
 from test_contracts import ConsumerStore, reference
@@ -229,6 +229,51 @@ class GateTests(unittest.TestCase):
             GatePolicy("admin", frozenset({S.ADMIN}))
         with self.assertRaises(ValueError):
             GatePolicy("no-approval", approval_required_for=frozenset())
+
+    def test_child_inherits_simulation_dimensions_and_may_only_tighten_approval(self):
+        child = SIM_POLICY.delegate("child", tools=frozenset({"sim"}))
+        self.assertEqual(child.simulation_dimensions, SIM_POLICY.simulation_dimensions)
+        dims = SIM_POLICY.simulation_dimensions
+        for redefined in (dims | {"trials"}, dims - {"horizon"}, frozenset()):
+            with self.subTest(sorted(redefined)), self.assertRaises(ValueError):
+                replace(child, simulation_dimensions=redefined)
+        stricter = replace(child, approval_required_for=frozenset({S.MUTATE, S.SIMULATE}))
+        self.assertIn(S.SIMULATE, stricter.approval_required_for)
+        with self.assertRaises(ValueError):
+            replace(stricter, parent=stricter, approval_required_for=frozenset({S.MUTATE}))
+
+    def test_effective_authority_is_task_and_policy_intersection(self):
+        self.run_script([ask("a", "admin"), finish()])  # Task allows it; policy does not
+        self.assertEqual(self.denial(), ("G1_AUTHORITY", "TOOL_NOT_ALLOWLISTED"))
+        self.setUp()
+        self.task = replace(self.task, allowed_tools=("sim",))  # policy allows; Task does not
+        self.run_script([ask("a"), finish()])
+        self.assertEqual(self.denial(), ("G1_AUTHORITY", "TOOL_NOT_ALLOWLISTED"))
+        self.assertEqual(self.dispatched(), [])
+
+    def test_dynamic_draws_are_never_evaluated_and_reserve_the_maximum(self):
+        pipeline = GatePipeline(self.task, self.specs, SIM_POLICY, None, None, Guard())
+        sim = self.specs["sim"]
+        self.assertEqual(pipeline.reservation("a", sim), {"rollouts": 4, "horizon": 30})
+        dynamic = replace(sim, declared_budget_draw={"rollouts": "__import__('os')"},
+                          max_budget_draw={"rollouts": 2})
+        self.assertEqual(pipeline.reservation("a", dynamic), {"rollouts": 2})
+        with self.assertRaises(GateDenied) as denied:
+            pipeline.reservation("a", replace(dynamic, max_budget_draw={}))
+        self.assertEqual(denied.exception.decision.reason_code, "UNRESERVABLE_DRAW")
+
+    def test_mutate_without_bound_reference_revision_cannot_dispatch(self):
+        pipeline = GatePipeline(self.task, self.specs, SIM_POLICY, None, None, Guard())
+        frozen = FrozenRequest(call("a", "mutate"), checksum(self.specs["mutate"]), S.MUTATE,
+                               {}, 0, None, SIM_POLICY.policy_version)
+        with self.assertRaises(GateDenied) as denied:
+            pipeline.check_dispatch(frozen, 0)
+        self.assertEqual(denied.exception.decision.reason_code, "REFERENCE_REVISION_UNBOUND")
+        bound = replace(frozen, expected_reference_revision=0)
+        pipeline.check_dispatch(bound, 0)  # both revision domains bound and current
+        with self.assertRaises(GateDenied) as denied:
+            pipeline.check_dispatch(bound, 1)  # task-state domain moved on its own
+        self.assertEqual(denied.exception.decision.reason_code, "STALE_STATE_REVISION")
 
     def test_child_task_without_delegated_policy_is_denied(self):
         self.task = replace(self.task, task_id="child", parent_task_id="t1")
