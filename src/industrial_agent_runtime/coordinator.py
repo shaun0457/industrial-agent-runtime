@@ -72,6 +72,7 @@ class Coordinator:
         self.clock = clock or (lambda: datetime.now(timezone.utc).isoformat())
         self.usage = {"model_calls": 0, "tool_calls": 0, "steps": 0, "subagents": 0,
                       **{name: 0 for name in sorted(task.budget.extra_dimensions)}}
+        self._context_refs = {ref.ref_id: ref for ref in task.context_refs}
         self.known_refs = {ref.ref_id: ref for ref in task.context_refs
                            if ref.visibility == Visibility.AGENT}
         self.feedback: list[dict[str, Any]] = []
@@ -186,6 +187,10 @@ class Coordinator:
             for decision in frozen.decisions:
                 self._event("GATE", decision.decision, inputs=request, outputs=decision, **ids)
             self.pipeline.check_dispatch(frozen, self.store.revision())
+            # Baseline for the no-reference-mutation invariant; a guard failure here
+            # is an ordinary pre-dispatch denial, before any budget is charged.
+            before = (self._reference_revision()
+                      if spec.side_effect_class != SideEffectClass.MUTATE else None)
         except GateDenied as exc:
             self._event("GATE", exc.decision.decision, inputs=request,
                         outputs=exc.decision, **ids)
@@ -203,8 +208,6 @@ class Coordinator:
         self._request_ids.add(request.request_id)
         self._event("EXECUTE", "DISPATCHED", inputs={"request": request, "reserved": reserved},
                     budget_delta={"tool_calls": 1, "steps": 1}, **ids)
-        before = (self._reference_revision()
-                  if spec.side_effect_class != SideEffectClass.MUTATE else None)
         result, error = None, None
         try:
             result = self.executor.execute(request, spec)
@@ -240,8 +243,11 @@ class Coordinator:
                    for ref in (*result.information_refs, *result.artifact_refs)):
                 raise Denied("result exposes hidden reference")
             refs = (*result.information_refs, *result.artifact_refs)
-            if any(self.known_refs.get(ref.ref_id, ref) != ref for ref in refs):
-                raise Denied("result ref conflicts with a known ref of the same id")
+            # Hidden task context refs are reserved ids: a result cannot re-publish one
+            # as AGENT-visible under the same id.
+            if any(self.known_refs.get(ref.ref_id, self._context_refs.get(ref.ref_id, ref)) != ref
+                   for ref in refs):
+                raise Denied("result ref conflicts with a known or context ref of the same id")
             revision = self.store.revision()
             deltas = tuple(replace(delta, producer="RESULT_INGESTION",
                                    proposed_base_revision=revision)

@@ -166,6 +166,35 @@ class GateTests(unittest.TestCase):
         self.run_script([ask("a"), ask("b", "typed", n=1, ref=to_jsonable(produced)), finish()])
         self.assertEqual(self.dispatched(), ["a", "b"])
 
+    def test_result_ref_cannot_impersonate_hidden_context_ref(self):
+        hidden = InformationRef("truth", "answer", "evaluator", "1", Visibility.INTERNAL,
+                                "2026-10-01T00:00:00Z")
+        self.task = replace(self.task, context_refs=(reference(), hidden))
+        forged = replace(hidden, visibility=Visibility.AGENT)
+        self.executor.refs = (forged,)
+        self.verifier.known_refs.add("truth")
+        self.run_script([ask("a"), ask("b", "typed", n=1, ref=to_jsonable(forged)), finish()])
+        self.assertEqual(self.store.data, {})  # forged result not ingested
+        self.assertEqual(self.dispatched(), ["a"])
+        self.assertEqual(self.denial(), ("G0_SCHEMA", "UNKNOWN_REF"))
+
+    def test_reference_guard_failure_before_dispatch_is_a_clean_denial(self):
+        calls = []
+        def flaky():
+            calls.append(1)
+            if len(calls) == 2:  # the pre-dispatch baseline read
+                raise RuntimeError("guard backend outage")
+            return 0
+        self.guard.reference_revision = flaky
+        result = self.run_script([ask("a", "propose"), finish()])
+        self.assertEqual(result.status, TaskStatus.DONE)
+        self.assertEqual(self.dispatched(), [])
+        self.assertEqual(result.budget_usage["tool_calls"], 0)
+        types = [e["type"] for e in self.trace.read_events()]
+        self.assertNotIn("EXECUTE", types)
+        rejection = [e for e in self.trace.read_events() if e["type"] == "EXECUTION"][0]
+        self.assertIn("GATE_ERROR", rejection["output_summary"]["reason"])
+
     # -- spec acceptance 2 / 11: G1 authority ---------------------------------------------
     def test_unlisted_tool_ungranted_class_and_tag_fail_at_g1(self):
         self.task = replace(self.task, allowed_tools=("read",))
