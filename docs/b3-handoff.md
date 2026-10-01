@@ -10,7 +10,7 @@ result ingestion; see "B3 implementation notes").
   `VerificationRejected`, `VerificationStage`, `VerifiedResult`.
 - Coordinator: every result passes the pipeline before ingestion; structured
   `VERIFY_RESULT` / `VERIFY_FINISH` / `INGESTION_ORDER` / `RESULT_INGESTION` trace.
-- Tests: `tests/test_verification.py` (21 tests) plus the unchanged B1/B2 suites.
+- Tests: `tests/test_verification.py` (25 tests) plus the unchanged B1/B2 suites.
 
 ## Requirement mapping
 
