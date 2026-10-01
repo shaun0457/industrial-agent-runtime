@@ -42,8 +42,8 @@ estimates are never valid.
 
 | # | Requirement | Test |
 |---|---|---|
-| 1, 15 | request-bound 600 under max 3600; origin traced | `test_exact_request_bound_draw_is_reserved_instead_of_the_maximum` |
-| 2, 3 | 600 fits 600; 599 denies at G2 before adapter | `test_exact_reservation_fits_exactly_and_one_unit_less_denies_before_adapter` |
+| 1, 15 | request-bound 600 under max 3600; origin traced | `test_request_bound_draw_is_reserved_instead_of_the_maximum` |
+| 2, 3 | 600 fits 600; 599 denies at G2 before adapter | `test_request_bound_reservation_fits_exactly_and_one_unit_less_denies_before_adapter` |
 | 4 | above max | `test_resolved_draw_above_the_tool_maximum_is_denied` |
 | 5 | negative / non-numeric | `test_negative_or_non_numeric_resolved_draws_are_denied` |
 | 6 | NaN / ±Inf | `test_non_finite_resolved_draws_are_denied` |
@@ -51,11 +51,11 @@ estimates are never valid.
 | 8 | missing resolver → max | `test_missing_resolver_or_omitted_dimension_reserves_the_maximum` |
 | 9 | missing max stays unreservable | `test_dynamic_dimension_without_maximum_stays_unreservable` |
 | 10 | numeric draw unchanged | `test_numeric_declared_draw_is_unchanged_and_never_resolved` |
-| 11 | WorkBatch sums request-bound reservations | `test_work_batch_preflight_sums_exact_reservations_before_any_dispatch` |
+| 11 | WorkBatch sums request-bound reservations | `test_work_batch_preflight_sums_request_bound_reservations_before_any_dispatch` |
 | 12 | resolver exception / drift fails closed | `test_resolver_exception_fails_closed_without_internals`, `test_work_batch_with_failing_resolver_dispatches_nothing`, `test_work_batch_item_whose_reservation_drifts_fails_closed_alone` |
 | 13 | SIMULATE rules unchanged | `test_simulation_classification_and_isolation_are_unchanged` |
 | 14 | MUTATE approval/revision unchanged | `test_mutate_approval_and_revision_binding_are_unchanged` |
-| 15 | FrozenRequest keeps G2 reservation | `test_frozen_request_keeps_exactly_the_g2_reservation`, `test_reservation_that_changes_between_preflight_and_authorization_is_denied`, `test_consumer_reservation_must_match_the_exact_reservation` |
+| 15 | FrozenRequest keeps G2 reservation | `test_frozen_request_keeps_exactly_the_g2_reservation`, `test_reservation_that_changes_between_preflight_and_authorization_is_denied`, `test_consumer_reservation_must_match_the_admitted_reservation` |
 | 16 | reconciliation unchanged (actual < reservation charged) | `test_post_execution_reconciliation_is_unchanged` |
 | 17 | determinism | `test_same_request_spec_and_context_give_identical_reservation_and_trace` |
 | 18 | no evaluation | `test_no_expression_string_is_evaluated` (traps `eval`/`exec`/`compile`, AST scan of `src`) |

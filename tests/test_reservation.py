@@ -18,6 +18,9 @@ from test_coordinator import Execute, Ingest, Verify, finish, scripted
 from test_gates import SIM_POLICY, Approval, Consumer, Guard, call
 
 S = SideEffectClass
+# Unpatched stage methods, so repeated spies never wrap an earlier spy.
+STAGE_METHODS = {"check_budget": GatePipeline.check_budget,
+                 "check_side_effect": GatePipeline.check_side_effect}
 RUNTIME_MODULES = tuple(
     module for name, module in sorted(vars(industrial_agent_runtime).items())
     if getattr(module, "__name__", "").startswith("industrial_agent_runtime.")
@@ -36,7 +39,7 @@ def ask(name, units, tool="span"):
 
 
 class Resolver:
-    """Trusted fixture resolver: the exact horizon is the requested unit count."""
+    """Trusted fixture resolver: the requested unit count bounds the horizon."""
 
     def __init__(self, fn=None):
         self.calls = []
@@ -117,7 +120,7 @@ class RequestBoundReservationTests(unittest.TestCase):
         self.assertEqual(result.budget_usage["tool_calls"], 0)
 
     # 1 / 15 ---------------------------------------------------------------------------
-    def test_exact_request_bound_draw_is_reserved_instead_of_the_maximum(self):
+    def test_request_bound_draw_is_reserved_instead_of_the_maximum(self):
         result = self.run_script([ask("a", 600), finish()])
         self.assertEqual(result.status, TaskStatus.DONE)
         self.assertEqual(self.g2_reserved(), [{"rollouts": 1, "horizon": 600}])
@@ -128,7 +131,7 @@ class RequestBoundReservationTests(unittest.TestCase):
                           "horizon": ReservationOrigin.REQUEST_BOUND})
 
     # 2 / 3 ----------------------------------------------------------------------------
-    def test_exact_reservation_fits_exactly_and_one_unit_less_denies_before_adapter(self):
+    def test_request_bound_reservation_fits_exactly_and_one_unit_less_denies_before_adapter(self):
         self.set_budget(horizon=600)
         self.assertEqual(self.run_script([ask("a", 600), finish()]).status, TaskStatus.DONE)
         self.assertEqual(self.dispatched(), ["a"])
@@ -188,7 +191,7 @@ class RequestBoundReservationTests(unittest.TestCase):
         self.assertEqual(dict(resolved.origins),
                          {"rollouts": "MAX_FALLBACK", "horizon": "DECLARED"})
 
-    def test_drift_is_reported_as_nondeterminism_before_g3(self):
+    def test_drift_to_a_zero_simulation_draw_is_reported_as_nondeterminism(self):
         self.specs["span"] = replace(self.specs["span"], declared_budget_draw={
             "rollouts": "arguments.units", "horizon": "arguments.units"})
         answers = iter([{"rollouts": 1, "horizon": 600}, {"rollouts": 0, "horizon": 0}])
@@ -207,8 +210,7 @@ class RequestBoundReservationTests(unittest.TestCase):
             return wrapper
         for name, stage in (("check_budget", "G2_BUDGET"),
                             ("check_side_effect", "G3_SIDE_EFFECT")):
-            patcher = mock.patch.object(GatePipeline, name,
-                                        spy(stage, getattr(GatePipeline, name)))
+            patcher = mock.patch.object(GatePipeline, name, spy(stage, STAGE_METHODS[name]))
             patcher.start()
             self.addCleanup(patcher.stop)
         return order
@@ -293,7 +295,7 @@ class RequestBoundReservationTests(unittest.TestCase):
                          {"rollouts": 2, "horizon": 30})
 
     # 11 -------------------------------------------------------------------------------
-    def test_work_batch_preflight_sums_exact_reservations_before_any_dispatch(self):
+    def test_work_batch_preflight_sums_request_bound_reservations_before_any_dispatch(self):
         batch = WorkBatch("b", "", (WorkItem("w1", "TOOL", (), span("a", 600)),
                                     WorkItem("w2", "TOOL", (), span("b", 600))))
         self.set_budget(horizon=1199)  # each item fits alone; the sum does not
@@ -421,7 +423,7 @@ class RequestBoundReservationTests(unittest.TestCase):
         self.assertEqual(self.denial(), ("G2_BUDGET", "RESERVATION_NOT_DETERMINISTIC"))
         self.assertEqual((self.dispatched(), self.gate.revisions), ([], []))
 
-    def test_consumer_reservation_must_match_the_exact_reservation(self):
+    def test_consumer_reservation_must_match_the_admitted_reservation(self):
         for claimed, outcome in (({"rollouts": 1, "horizon": 600}, ["a"]),
                                  ({"rollouts": 1, "horizon": 3600}, [])):
             with self.subTest(claimed=claimed):
@@ -454,7 +456,7 @@ class RequestBoundReservationTests(unittest.TestCase):
             raise RuntimeError("adapter crashed")
         self.executor.execute = explode
         result = self.run_script([ask("a", 600), finish()])
-        self.assertEqual(result.budget_usage["horizon"], 600)  # full exact reservation
+        self.assertEqual(result.budget_usage["horizon"], 600)  # full request-bound reservation
         self.assertEqual(self.store.data, {})
 
     # 17 / 18 --------------------------------------------------------------------------

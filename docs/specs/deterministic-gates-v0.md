@@ -351,7 +351,9 @@ actual successful   = 450 seconds   (charged at reconciliation; 150 released)
 
 This is the actual evaluation order. Denial precedence follows it: a request that
 fails both the G2 quota and a G3 rule is denied at `G2_BUDGET`, and G3 is not
-evaluated.
+evaluated. One pre-existing exception is unchanged: a malformed ToolSpec draw
+declaration (e.g. declared draw above its maximum, or a standard dimension) is
+detected during G2a sizing but reported as `G0_SCHEMA`/`INVALID_TOOL_SPEC`.
 
 ```text
 ToolCallRequest
@@ -371,8 +373,11 @@ ToolCallRequest
 In code, `GatePipeline.static_check` runs G0, G1, G2a, and G2b plus resolved-bound
 validation. `GatePipeline.check_budget` runs the G2 quota check, and only then
 `GatePipeline.check_side_effect` runs G3. `authorize` runs that sequence for one
-request. WorkBatch preflight sizes every item (G0–G2b) and runs the cumulative G2
-quota check, then G3 for every item in stable item order, all before any dispatch.
+request. WorkBatch preflight sizes every item (G0–G2b), runs its structural checks
+(duplicate ids, dependencies, cycles, budget requests) and the cumulative G2 quota
+check, then G3 for every item in lexical `work_id` order, all before any dispatch.
+The Coordinator rejects a reused `request_id` or missing execution hooks before G2
+quota/G3, as plain runtime denials.
 
 ```text
 ReservationResolver.resolve_reservation(

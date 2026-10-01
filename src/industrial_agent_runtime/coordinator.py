@@ -346,12 +346,12 @@ class Coordinator:
             if sum(item.budget_request.get(name, 0) for item in batch.items) > self._remaining(name):
                 raise Denied("cumulative WorkItem budget exceeds remaining quota")
         # Cumulative G2 preflight: all request-bound item reservations must fit
-        # together. Only then is G3 judged, in stable item order (stage precedence).
+        # together. Only then is G3 judged, in lexical work_id order (stage precedence).
         self.pipeline.check_budget(batch.batch_id, {
             "tool_calls": len(items), "steps": len(items), **reserved}, self.usage)
-        for item in batch.items:
-            self.pipeline.check_side_effect(item.request_or_subtask.request_id,
-                                            specs[item.work_id], sized[item.work_id].draw)
+        for key in sorted(items):
+            self.pipeline.check_side_effect(items[key].request_or_subtask.request_id,
+                                            specs[key], sized[key].draw)
         return sized
 
     def _batch(self, batch: WorkBatch) -> None:
