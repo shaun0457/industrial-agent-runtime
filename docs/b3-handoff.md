@@ -10,7 +10,7 @@ result ingestion; see "B3 implementation notes").
   `VerificationRejected`, `VerificationStage`, `VerifiedResult`.
 - Coordinator: every result passes the pipeline before ingestion; structured
   `VERIFY_RESULT` / `VERIFY_FINISH` / `INGESTION_ORDER` / `RESULT_INGESTION` trace.
-- Tests: `tests/test_verification.py` (25 tests) plus the unchanged B1/B2 suites.
+- Tests: `tests/test_verification.py` (29 tests) plus the unchanged B1/B2 suites.
 
 ## Requirement mapping
 
@@ -29,18 +29,12 @@ result ingestion; see "B3 implementation notes").
 | trace-visible stable order | `test_wave_ingestion_order_is_trace_visible_and_stable` |
 | determinism | `test_identical_runs_produce_identical_verification_traces` |
 
-## Contract gaps resolved conservatively (flagged for review, not blocking)
+## Batch-3 review closure — adjudicated
 
-1. `ResultVerifier.verify_result` returns `bool`, so a consumer rejection is traced
-   as `CONSUMER/CONSUMER_REJECTED` without a consumer-specific reason code. Runtime
-   stages are fully structured.
-2. The spec requires "provenance/tool-version fields" without naming them. v0
-   requires a nonempty `provenance.tool_version`; optional `request_id`/`tool_name`
-   must match the dispatched request when present.
-3. Ref content existence remains in consumer `verify_result` (no new resolver hook);
-   the runtime checks structure, visibility, id conflicts, embedded refs, and that
-   finish refs are verified refs of the run.
-4. Finish output is validated against `Task.output_schema` with the B2 schema
-   subset; unsupported keywords fail closed.
+The earlier contract gaps are accepted decisions D-039–D-042 (see the spec's
+"Accepted Batch-3 decisions"): bool consumer verifier retained, minimum generic
+provenance (with ToolSpec-declared `tool_version` pinning), content existence
+consumer-owned with exact-duplicate ref and `reason_ref` checks, and the shared
+B2 schema subset for finish. D-043 (tep-sim ReplaySpec) is recorded alongside.
 
 No `SPEC_CONFLICT`.

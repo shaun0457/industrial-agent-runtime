@@ -336,6 +336,61 @@ class ReviewHardeningTests(Harness):
         self.assertEqual(rejected[0]["reason_code"], "CONSUMER_REJECTED")
 
 
+class BatchThreeClosureTests(Harness):
+    def setUp(self):
+        super().setUp()
+        self.verifier.verify_result = lambda *args: True
+
+    def test_declared_tool_version_must_match_result_provenance(self):
+        self.spec = replace(self.spec, provider_metadata={"tool_version": "fixture-v2"})
+        self.assert_rejected("V1_PROVENANCE", "TOOL_VERSION_MISMATCH")
+        self.setUp()
+        self.spec = replace(self.spec, provider_metadata={"tool_version": "fixture-v1"})
+        self.one_call()
+        self.assertEqual(self.events("VERIFY_RESULT")[0]["status"], "ACCEPTED")
+        self.setUp()
+        self.spec = replace(self.spec, provider_metadata={"tool_version": ""})
+        self.one_call()  # nothing declared: presence only
+        self.assertEqual(self.events("VERIFY_RESULT")[0]["status"], "ACCEPTED")
+
+    def test_exact_duplicate_ref_declarations_are_rejected(self):
+        self.executor.refs = (ref(), ref())
+        self.assert_rejected("V3_REFS", "DUPLICATE_REF_ID")
+        self.setUp()
+        self.executor.refs = (ref(),)
+        self.run_script([scripted(Action.TOOL_REQUEST, tool_request=request("a")),
+                         finish(information_refs=(ref(),), artifact_refs=(ref(),)), finish()])
+        codes = [e["output_summary"]["reason_code"] for e in self.events("VERIFY_FINISH")
+                 if e["status"] == "REJECTED"]
+        self.assertEqual(codes, ["DUPLICATE_REF_ID"])
+
+    def reasoned(self, reason):
+        self.ingestor.derive_deltas = lambda result: (StateDelta(
+            "SET_NOTE", "result-" + result.request_id, result.structured_output,
+            "ignored", -99, reason),)
+
+    def test_reason_ref_must_exactly_match_a_result_or_known_ref(self):
+        for code, reason in (("UNKNOWN_REASON_REF", ref("never-seen")),
+                             ("UNKNOWN_REASON_REF", ref(version="2"))):
+            with self.subTest(reason.ref_id):
+                self.setUp()
+                self.executor.refs = (ref(),)
+                self.reasoned(reason)
+                self.assert_rejected("V5_INGESTION_STRUCTURE", code)
+
+    def test_reason_ref_from_result_or_agent_context_is_accepted(self):
+        context = ref("ctx-1", kind="document")
+        for reason in (ref(), context):
+            with self.subTest(reason.ref_id):
+                self.setUp()
+                self.task = replace(self.task, context_refs=(*self.task.context_refs, context))
+                self.executor.refs = (ref(),)
+                self.reasoned(reason)
+                self.one_call()
+                self.assertEqual(self.events("VERIFY_RESULT")[0]["status"], "ACCEPTED")
+                self.assertIn("result-a", self.store.data)
+
+
 class PipelineUnitTests(unittest.TestCase):
     def test_pipeline_is_deterministic_and_takes_no_model_input(self):
         verifier, ingestor = Verify(), Ingest()

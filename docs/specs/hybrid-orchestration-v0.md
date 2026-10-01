@@ -389,3 +389,23 @@ and the `Coordinator` ingestion/finish paths. The B1 `ResultVerifier` and
   envelopes must equal the declared or known ref exactly (same rule as the B2 gate).
   Consumer `verify_finish` rejections and errors are traced as `VERIFY_FINISH`
   decisions; a `verify_finish` exception still fails the run (B1 semantics).
+
+### Accepted Batch-3 decisions
+
+Recorded in the program Decision Register (`tep-sim/docs/ecosystem/decision-register.md`).
+
+- **D-039** — `ResultVerifier.verify_result(...) -> bool` is retained for v0; a
+  non-`True` verdict is `CONSUMER/CONSUMER_REJECTED`. No verifier decision hook.
+- **D-040** — Minimum generic tool provenance: `provenance.tool_version` is
+  mandatory and nonempty. If `ToolSpec.provider_metadata["tool_version"]` is a
+  nonempty string, the result must equal it, else `V1_PROVENANCE/TOOL_VERSION_MISMATCH`.
+  Optional `request_id`/`tool_name` must exactly match when present. Deeper
+  provenance validation is consumer-owned.
+- **D-041** — Content/artifact existence is consumer-owned (`verify_result`); no
+  storage resolver hook. A result or finish proposal must not declare a `ref_id`
+  more than once, even as an exact duplicate (`DUPLICATE_REF_ID`). A non-null
+  result-ingestion `StateDelta.reason_ref` must be a valid AGENT `InformationRef`
+  (`HIDDEN_REASON_REF` otherwise) that exactly matches a ref of the result being
+  verified or an already-known verified/context ref (`UNKNOWN_REASON_REF`).
+- **D-042** — Finish verification uses the same deterministic B2 schema subset for
+  `Task.output_schema`; unsupported keywords fail closed.

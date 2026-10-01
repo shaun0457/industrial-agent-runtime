@@ -111,7 +111,7 @@ def check_refs(run: _Run, refs: Sequence[Any], embedded: Sequence[Mapping[str, A
             run.reject(stage, "MALFORMED_REF", "reference is not a well-formed InformationRef")
         if ref.visibility != Visibility.AGENT:
             run.reject(stage, "HIDDEN_REF", "non-AGENT reference cannot reach the Agent plane")
-        if seen.get(ref.ref_id, ref) != ref:
+        if ref.ref_id in seen:  # even an exact duplicate declaration is rejected
             run.reject(stage, "DUPLICATE_REF_ID", f"ref id {ref.ref_id!r} is declared twice")
         if reserved.get(ref.ref_id, ref) != ref:
             run.reject(stage, "REF_ID_CONFLICT",
@@ -165,6 +165,12 @@ class ResultVerificationPipeline:
             if not isinstance(provenance.get(name), str) or not provenance[name]:
                 run.reject(VerificationStage.V1_PROVENANCE, "MISSING_PROVENANCE_FIELD",
                            f"provenance requires a nonempty {name}")
+        # D-040: a ToolSpec that declares its version pins the result's tool_version.
+        metadata = spec.provider_metadata
+        expected = metadata.get("tool_version") if isinstance(metadata, Mapping) else None
+        if isinstance(expected, str) and expected and provenance["tool_version"] != expected:
+            run.reject(VerificationStage.V1_PROVENANCE, "TOOL_VERSION_MISMATCH",
+                       "result tool_version differs from the ToolSpec-declared version")
         for name, expected in (("request_id", request.request_id),
                                ("tool_name", request.tool_name)):
             if name in provenance and provenance[name] != expected:
@@ -203,6 +209,12 @@ class ResultVerificationPipeline:
                for delta in derived):
             run.reject(VerificationStage.V5_INGESTION_STRUCTURE, "HIDDEN_REASON_REF",
                        "ingestion delta cites a malformed or non-AGENT reason ref")
+        result_refs = {item.ref_id: item for item in refs}
+        if any(delta.reason_ref is not None and delta.reason_ref not in (
+                result_refs.get(delta.reason_ref.ref_id), known.get(delta.reason_ref.ref_id))
+               for delta in derived):
+            run.reject(VerificationStage.V5_INGESTION_STRUCTURE, "UNKNOWN_REASON_REF",
+                       "reason ref must exactly match a ref of this result or a known ref")
         # Ingestion binds the CURRENT revision, never the originating projection's.
         deltas = tuple(replace(delta, producer=INGESTION_PRODUCER,
                                proposed_base_revision=current_revision) for delta in derived)
