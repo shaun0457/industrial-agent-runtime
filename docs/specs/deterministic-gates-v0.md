@@ -235,3 +235,87 @@ There is no automatic retry loop. A retry/replan is a new explicit request and c
 10. Consumer denial cannot be overridden by another model message.
 11. Child requesting parent-only authority is denied.
 12. A ModelStateUpdateProposal is routed to TaskStateStore validation, consumes no tool-call budget, and cannot alter runtime budget/policy/authority fields.
+
+## B2 implementation notes (v0)
+
+Implemented in `industrial_agent_runtime.gates` (pipeline), `schema` (G0 subset), and
+the `Coordinator` dispatch path. No frozen public contract was changed; the B1
+`RequestGate.validate_request` signature is kept as the consumer hook (D-012).
+
+- **Task policy.** See "Accepted Batch-2 decisions" D-036 below. The default
+  `GatePolicy` grants READ/COMPUTE only. ADMIN cannot be granted in v0 and MUTATE
+  always requires approval. A child task without a delegated policy is denied at G1.
+- **G0.** A dependency-free JSON Schema subset. Unsupported keywords deny;
+  they are never ignored. Every `InformationRef`-shaped argument (any mapping
+  with `ref_id`) must parse, be AGENT-visible, and exactly match a ref known to
+  the run: an Agent-visible task context ref or a ref from a verified result.
+- **G2.** Standard `tool_calls`/`steps` plus configured `Budget.extra_dimensions`.
+  A numeric `declared_budget_draw` is reserved as-is (≤ `max_budget_draw`). The
+  runtime does not interpret string (expression) draws in v0: they reserve
+  `max_budget_draw` and are unreservable without it. Tools cannot declare
+  runtime-charged standard dimensions. WorkBatch preflight checks the cumulative
+  reservation of all items before any dispatch.
+- **Reconciliation.** After execution, actual draw is charged, not the
+  reservation. Over-draw, unreported reserved dimensions, unreserved dimensions,
+  or invalid values are violations. A violating result is charged at least its
+  reservation and is never ingested. An adapter exception is charged the full
+  reservation.
+- **G3 / compound SIMULATE.** Which extra dimensions represent simulation work is
+  consumer configuration (`GatePolicy.simulation_dimensions`). A tool drawing them
+  must be SIMULATE. A SIMULATE tool must declare an isolation guarantee and
+  reserve a positive simulation draw. SIMULATE/PROPOSE/MUTATE require a consumer
+  `ReferenceStateGuard`. If a non-MUTATE execution changes the reference
+  revision, the run fails closed.
+- **MUTATE binding / approval (OQ-5 minimal surface).** The frozen request binds
+  the task-state revision, the reference revision, the ToolSpec checksum, and the
+  reservation. `ApprovalHook.decide(frozen)` returns APPROVE or DENY; if no hook
+  is configured, the request is denied. Immediately before dispatch, a changed
+  spec, task-state revision, or (MUTATE) reference revision is rejected.
+- Consumer `normalized_request_ref` is unsupported in v0 (the exact request
+  is dispatched), and a consumer reservation must equal the runtime reservation.
+
+## Accepted Batch-2 decisions
+
+Adjudicated at the Batch-2 review closure; recorded in the program Decision Register
+(`tep-sim/docs/ecosystem/decision-register.md`, D-036–D-038). They replace the three
+"contract gaps resolved conservatively" flagged in `docs/b2-handoff.md`.
+
+### D-036 — `GatePolicy` is separate from `Task`
+
+- `Task` describes the requested work and tool surface (`allowed_tools`, budget, output).
+- `GatePolicy` is trusted, application-supplied execution authority (side-effect
+  class grants, policy tags, tool allowlist, approval requirements, simulation
+  classification). It is **never model-authored**.
+- Effective authority is the **intersection** of Task permissions and GatePolicy
+  grants: a tool must be in `Task.allowed_tools` *and* allowed by every policy in the
+  delegation chain, and its class/tags must be granted.
+- Delegated child policies (`GatePolicy.delegate`):
+  - tools, side-effect classes, and policy tags may only **narrow**;
+  - approval requirements may only become **stricter** (superset);
+  - `simulation_dimensions` are classification semantics, not child authority, and
+    MUST be **inherited unchanged** in v0. A child that redefines them (adds, drops,
+    or clears dimensions) is rejected at construction.
+
+### D-037 — Dynamic budget draws are not evaluated in v0
+
+- There is no expression language in v0.
+- Numeric `declared_budget_draw` → reserve that numeric value (≤ `max_budget_draw`
+  when one is declared).
+- String/dynamic declaration → the runtime does not evaluate it; the dimension
+  requires `max_budget_draw` and **reserves the maximum**.
+- Missing maximum → denied at G2 as `UNRESERVABLE_DRAW`.
+- Actual usage is reconciled after execution (see Reconciliation above).
+
+### D-038 — Two revision domains
+
+- `GateDecision.expected_state_revision` = the consumer `TaskStateStore`/task-state
+  revision (unchanged).
+- `FrozenRequest.expected_state_revision` = task/investigation state revision.
+- `FrozenRequest.expected_reference_revision` = external/reference-world revision
+  (from the consumer `ReferenceStateGuard`).
+- One field is never overloaded to represent both domains.
+- An enabled MUTATE request binds **both** revisions in the frozen request presented
+  for approval, and both are re-checked immediately before dispatch after approval:
+  a changed task-state revision denies `STALE_STATE_REVISION`, a changed reference
+  revision denies `STALE_REFERENCE_REVISION`, and a MUTATE without a bound
+  reference revision denies `REFERENCE_REVISION_UNBOUND`.

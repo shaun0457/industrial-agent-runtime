@@ -13,6 +13,8 @@ from .coordinator import Coordinator
 from .hooks import (Executor, GateDecision, ModelProvider, RequestGate,
                     ResultIngestor, ResultVerifier)
 from .provider import FakeProvider
+from .gates import (DEFAULT_POLICY, ApprovalHook, FrozenRequest, GateDenied, GatePipeline,
+                    GatePolicy, GateStage, Reconciliation, ReferenceStateGuard, reconcile)
 
 __all__ = [
     "Budget", "ContextProjection", "InformationRef", "ModelStateUpdateProposal",
@@ -23,4 +25,6 @@ __all__ = [
     "Action", "Coordinator", "Executor", "FakeProvider", "FinishProposal", "GateDecision",
     "ModelProvider", "ModelTurn", "RequestGate", "ResultIngestor", "ResultVerifier",
     "ToolCallRequest", "WorkBatch", "WorkItem",
+    "DEFAULT_POLICY", "ApprovalHook", "FrozenRequest", "GateDenied", "GatePipeline",
+    "GatePolicy", "GateStage", "Reconciliation", "ReferenceStateGuard", "reconcile",
 ]

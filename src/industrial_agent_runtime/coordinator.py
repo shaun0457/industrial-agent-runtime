@@ -1,7 +1,9 @@
-"""B1 reference loop: typed routing, atomic updates, and ordered TOOL waves.
+"""Reference loop: typed routing, atomic updates, B2 gates, and ordered TOOL waves.
 
 Execution is fail-closed without trusted gate, Executor, verifier, and ingestion
-hooks. This intentionally restricted B1 surface is not the full B2/B3 runtime.
+hooks. Every executable request passes the B2 GatePipeline (G0-G3, consumer
+validate_request, approval) and is re-bound immediately before dispatch.
+Post-execution verification beyond B2 reconciliation remains B3; SUBTASK is B4.
 """
 
 from collections.abc import Callable, Mapping, Sequence
@@ -15,7 +17,9 @@ from .actions import Action, ModelTurn, ToolCallRequest, WorkBatch
 from .contracts import (ContextProjection, InformationRef, Revision, RuntimeResult,
                         SideEffectClass, StateDelta, Task, TaskStatus, ToolResult,
                         ToolSpec, TraceEvent, Visibility)
-from .hooks import Executor, GateDecision, ModelProvider, RequestGate, ResultIngestor, ResultVerifier
+from .gates import (DEFAULT_POLICY, STANDARD_DIMENSIONS, ApprovalHook, GateDenied,
+                    GatePipeline, GatePolicy, ReferenceStateGuard, reconcile)
+from .hooks import Executor, ModelProvider, RequestGate, ResultIngestor, ResultVerifier
 from .protocols import TaskStateStore
 from .serialization import canonical_json, checksum, freeze_json
 from .trace import TraceRecorder
@@ -25,27 +29,19 @@ class Denied(ValueError):
     """An auditable deterministic rejection, never an execution retry signal."""
 
 
+class InvariantViolation(RuntimeError):
+    """A breached runtime invariant; the run fails closed instead of continuing."""
+
+
 TERMINAL_STATUSES = frozenset({TaskStatus.DONE, TaskStatus.FAILED,
                              TaskStatus.EXHAUSTED, TaskStatus.CANCELLED})
-
-
-def _has_hidden_ref(value: Any) -> bool:
-    """Inspect JSON ref envelopes; semantic/string-ref resolution belongs to B2."""
-    if isinstance(value, Mapping):
-        if "ref_id" in value and "visibility" in value and value["visibility"] != "AGENT":
-            return True
-        return any(_has_hidden_ref(item) for item in value.values())
-    if isinstance(value, (tuple, list)):
-        return any(_has_hidden_ref(item) for item in value)
-    return False
 
 
 class Coordinator:
     """One single-writer run with a consumer state store and bounded fake model.
 
-    B1 supports READ/COMPUTE tools with zero declared/actual extra resource draw.
-    SIMULATE/PROPOSE/MUTATE/ADMIN, SUBTASK, and token-metered providers remain
-    fail-closed until the downstream implementations provide those capabilities.
+    Side-effect authority comes only from the trusted ``gate_policy`` (default:
+    READ/COMPUTE). SUBTASK and token-metered providers remain fail-closed.
     """
 
     def __init__(self, task: Task, store: TaskStateStore, provider: ModelProvider,
@@ -55,6 +51,9 @@ class Coordinator:
                  executor: Executor | None = None,
                  verifier: ResultVerifier | None = None,
                  ingestor: ResultIngestor | None = None,
+                 gate_policy: GatePolicy | None = None,
+                 approval: ApprovalHook | None = None,
+                 reference_guard: ReferenceStateGuard | None = None,
                  projection_policy: Mapping[str, Any] | None = None,
                  clock: Callable[[], str] | None = None) -> None:
         self.task, self.store, self.provider, self.trace = task, store, provider, trace
@@ -66,9 +65,16 @@ class Coordinator:
             if not isinstance(self.metadata.get(key), str) or not self.metadata[key]:
                 raise ValueError(f"model metadata requires {key}")
         self.gate, self.executor, self.verifier, self.ingestor = gate, executor, verifier, ingestor
+        self.pipeline = GatePipeline(task, self.specs, gate_policy or DEFAULT_POLICY,
+                                     gate, approval, reference_guard)
+        self.reference_guard = reference_guard
         self.policy = freeze_json(projection_policy or {})
         self.clock = clock or (lambda: datetime.now(timezone.utc).isoformat())
-        self.usage = {"model_calls": 0, "tool_calls": 0, "steps": 0, "subagents": 0}
+        self.usage = {"model_calls": 0, "tool_calls": 0, "steps": 0, "subagents": 0,
+                      **{name: 0 for name in sorted(task.budget.extra_dimensions)}}
+        self._context_refs = {ref.ref_id: ref for ref in task.context_refs}
+        self.known_refs = {ref.ref_id: ref for ref in task.context_refs
+                           if ref.visibility == Visibility.AGENT}
         self.feedback: list[dict[str, Any]] = []
         self._event_count = 0
         self._ran = False
@@ -91,8 +97,8 @@ class Coordinator:
         self._event("MODEL_REJECTION" if stage == "MODEL_TURN" else stage,
                     "DENIED", outputs=feedback)
 
-    def _remaining(self, dimension: str) -> int:
-        return getattr(self.task.budget, "max_" + dimension) - self.usage[dimension]
+    def _remaining(self, dimension: str) -> float:
+        return GatePipeline.remaining(self.task.budget, self.usage, dimension)
 
     def _charge(self, **draw: int) -> None:
         if any(amount > self._remaining(name) for name, amount in draw.items()):
@@ -160,53 +166,74 @@ class Coordinator:
                      "resulting_revision": current}, budget_delta={"steps": 1})
         return True
 
-    def _request_supported(self, request: ToolCallRequest) -> ToolSpec:
-        if not isinstance(request, ToolCallRequest):
-            raise Denied("typed ToolCallRequest required")
-        if request.tool_name not in self.task.allowed_tools or request.tool_name not in self.specs:
-            raise Denied("unknown or unlisted tool")
+    def _request_supported(self, request: ToolCallRequest) -> tuple[ToolSpec, dict[str, float]]:
+        """Static G0/G1/G3 checks plus reservation sizing; no state or budget change."""
+        spec, reservation, _ = self.pipeline.static_check(request, self.known_refs)
         if request.request_id in self._request_ids:
             raise Denied("request_id already dispatched; use a new explicit request")
-        if _has_hidden_ref(request.arguments):
-            raise Denied("executable request contains a hidden reference envelope")
-        spec = self.specs[request.tool_name]
-        if spec.side_effect_class not in {SideEffectClass.READ, SideEffectClass.COMPUTE}:
-            raise Denied("side-effect class requires downstream B2 implementation")
-        if spec.declared_budget_draw or spec.max_budget_draw:
-            raise Denied("resource reservation requires downstream B2 implementation")
         if any(hook is None for hook in (self.gate, self.executor, self.verifier, self.ingestor)):
             raise Denied("execution requires explicit gate/executor/verifier/ingestor hooks")
-        return spec
+        return spec, reservation
+
+    def _reference_revision(self) -> Revision | None:
+        return None if self.reference_guard is None else self.reference_guard.reference_revision()
 
     def _execute(self, request: ToolCallRequest, **ids: Any) -> ToolResult | None:
+        request_id = getattr(request, "request_id", None)
         try:
-            spec = self._request_supported(request)
-            if self._remaining("tool_calls") < 1 or self._remaining("steps") < 1:
-                raise Denied("tool/step budget exhausted")
-            revision = self.store.revision()
-            decision = self.gate.validate_request(
-                request, spec, self.task, revision, freeze_json(self.usage))
-            if not isinstance(decision, GateDecision):
-                raise Denied("invalid gate decision")
-            self._event("GATE", decision.decision, inputs=request, outputs=decision, **ids)
-            if (decision.request_id != request.request_id or decision.decision != "ALLOW"
-                    or decision.expected_state_revision != revision
-                    or decision.reserved_budget_draw or decision.normalized_request_ref is not None):
-                raise Denied("gate denied, unbound, or requires unsupported reservation/normalization")
-            if self.store.revision() != revision:
-                raise Denied("state changed during authorization")
-            self._charge(tool_calls=1, steps=1)
-            self._request_ids.add(request.request_id)
-            self._event("EXECUTE", "DISPATCHED", inputs=request,
-                        budget_delta={"tool_calls": 1, "steps": 1}, **ids)
+            spec, _ = self._request_supported(request)
+            frozen = self.pipeline.authorize(request, self.known_refs, self.usage,
+                                             self.store.revision())
+            for decision in frozen.decisions:
+                self._event("GATE", decision.decision, inputs=request, outputs=decision, **ids)
+            self.pipeline.check_dispatch(frozen, self.store.revision())
+            # Baseline for the no-reference-mutation invariant; a guard failure here
+            # is an ordinary pre-dispatch denial, before any budget is charged.
+            before = (self._reference_revision()
+                      if spec.side_effect_class != SideEffectClass.MUTATE else None)
+        except GateDenied as exc:
+            self._event("GATE", exc.decision.decision, inputs=request,
+                        outputs=exc.decision, **ids)
+            self._deny("EXECUTION", str(exc), request_id=request_id,
+                       reason_code=exc.decision.reason_code, **ids)
+            return None
+        except Denied as exc:
+            self._deny("EXECUTION", str(exc), request_id=request_id, **ids)
+            return None
+        except Exception as exc:  # a gate that cannot decide denies
+            self._deny("EXECUTION", f"GATE_ERROR: {exc}", request_id=request_id, **ids)
+            return None
+        reserved = frozen.reserved_budget_draw
+        self._charge(tool_calls=1, steps=1)
+        self._request_ids.add(request.request_id)
+        self._event("EXECUTE", "DISPATCHED", inputs={"request": request, "reserved": reserved},
+                    budget_delta={"tool_calls": 1, "steps": 1}, **ids)
+        result, error = None, None
+        try:
             result = self.executor.execute(request, spec)
             if not isinstance(result, ToolResult) or result.request_id != request.request_id:
                 raise Denied("executor returned malformed/misbound result")
-            self._event("TOOL_RESULT", "RETURNED", outputs=result, **ids)
-            return result
         except Exception as exc:
-            self._deny("EXECUTION", str(exc), request_id=request.request_id, **ids)
+            result, error = None, str(exc)
+        # Unknown actual use (adapter failure) is charged at the full reservation.
+        accounting = reconcile(reserved, result.actual_budget_draw if result else reserved,
+                               self.task.budget)
+        for name, amount in accounting.charged.items():
+            self.usage[name] += amount
+        self._event("RECONCILIATION", "VIOLATION" if accounting.violations else "RECONCILED",
+                    outputs=accounting, budget_delta=accounting.charged, **ids)
+        if before is not None and self._reference_revision() != before:
+            raise InvariantViolation(f"{spec.side_effect_class.value} request "
+                                     f"{request.request_id} changed reference state")
+        if error is not None:
+            self._deny("EXECUTION", error, request_id=request.request_id, **ids)
             return None
+        self._event("TOOL_RESULT", "RETURNED", outputs=result, **ids)
+        if accounting.violations:
+            self._deny("EXECUTION", "RECONCILIATION_VIOLATION: " + "; ".join(accounting.violations),
+                       request_id=request.request_id, **ids)
+            return None
+        return result
 
     def _ingest(self, request: ToolCallRequest, result: ToolResult, **ids: Any) -> bool:
         try:
@@ -215,9 +242,12 @@ class Coordinator:
             if any(ref.visibility != Visibility.AGENT
                    for ref in (*result.information_refs, *result.artifact_refs)):
                 raise Denied("result exposes hidden reference")
-            if any(type(value) not in (int, float) or not math.isfinite(value) or value != 0
-                   for value in result.actual_budget_draw.values()):
-                raise Denied("unreserved resource use in B1 result")
+            refs = (*result.information_refs, *result.artifact_refs)
+            # Hidden task context refs are reserved ids: a result cannot re-publish one
+            # as AGENT-visible under the same id.
+            if any(self.known_refs.get(ref.ref_id, self._context_refs.get(ref.ref_id, ref)) != ref
+                   for ref in refs):
+                raise Denied("result ref conflicts with a known or context ref of the same id")
             revision = self.store.revision()
             deltas = tuple(replace(delta, producer="RESULT_INGESTION",
                                    proposed_base_revision=revision)
@@ -231,6 +261,8 @@ class Coordinator:
                 "deltas": deltas, "expected_revision": revision}, **ids)
             new_revision = (self.store.apply_batch(deltas, expected_revision=revision)
                             if deltas else revision)
+            for ref in refs:  # verified Agent-visible refs become citable in later requests
+                self.known_refs.setdefault(ref.ref_id, ref)
             self._event("RESULT_INGESTION", "ACCEPTED", inputs={
                 "deltas": deltas, "expected_revision": revision},
                 outputs={"resulting_revision": new_revision, "order": "work_id_lexical_per_wave"},
@@ -247,12 +279,15 @@ class Coordinator:
         if len(items) != len(batch.items):
             raise Denied("duplicate work_id")
         request_ids = set()
+        reserved: dict[str, float] = {}
         for item in batch.items:
             if item.kind != "TOOL":
                 raise Denied("SUBTASK execution requires downstream B4 implementation")
             if item.status != "PENDING":
                 raise Denied("model may not pre-complete work")
-            self._request_supported(item.request_or_subtask)
+            _, draw = self._request_supported(item.request_or_subtask)
+            for name, amount in draw.items():
+                reserved[name] = reserved.get(name, 0) + amount
             request_id = item.request_or_subtask.request_id
             if request_id in request_ids:
                 raise Denied("duplicate request_id in batch")
@@ -274,11 +309,15 @@ class Coordinator:
             for name, amount in draw.items():
                 if type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0:
                     raise Denied("invalid requested budget")
-                if name not in {"tool_calls", "steps"} or amount > self._remaining(name):
+                if ((name in STANDARD_DIMENSIONS and name not in {"tool_calls", "steps"})
+                        or amount > self._remaining(name)):
                     raise Denied("unsupported/excessive WorkBatch budget request")
-        for name in ("tool_calls", "steps"):
+        for name in sorted({"tool_calls", "steps", *self.task.budget.extra_dimensions}):
             if sum(item.budget_request.get(name, 0) for item in batch.items) > self._remaining(name):
                 raise Denied("cumulative WorkItem budget exceeds remaining quota")
+        # Cumulative G2 preflight: all declared item reservations must fit together.
+        self.pipeline.check_budget(batch.batch_id, {
+            "tool_calls": len(items), "steps": len(items), **reserved}, self.usage)
 
     def _batch(self, batch: WorkBatch) -> None:
         try:
