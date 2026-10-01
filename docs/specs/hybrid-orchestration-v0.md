@@ -343,3 +343,43 @@ MCP is not an orchestration dependency; if used later, it is only one possible e
 11. Post-execution `verify_result` rejects a result/final claim referencing a nonexistent artifact/ref.
 12. Same ModelTurn/WorkBatch plus deterministic tool results produces identical state-update/scheduling/verification/ingestion trace.
 13. Runtime package operates without LangGraph or MCP installed.
+
+## B3 implementation notes (v0)
+
+Implemented in `industrial_agent_runtime.verification` (`ResultVerificationPipeline`)
+and the `Coordinator` ingestion/finish paths. The B1 `ResultVerifier` and
+`ResultIngestor` protocols are unchanged; no new consumer hook is added.
+
+- **Stage order.** `V0_IDENTITY` (typed `ToolResult`, `request_id` bound to the
+  dispatched request, status `SUCCESS`) -> `V1_PROVENANCE` -> `V2_OUTPUT_SCHEMA`
+  (B2 schema subset against `ToolSpec.output_schema`) -> `V3_REFS` -> `V4_ACCOUNTING`
+  (B2 reconciliation must be violation-free) -> `V5_INGESTION_STRUCTURE`
+  (consumer `derive_deltas` yields well-formed `StateDelta`s with AGENT-only reason
+  refs; producer forced to `RESULT_INGESTION`; `proposed_base_revision` = CURRENT
+  revision) -> consumer `verify_result(...) is True` -> `V6_REVISION` (state unchanged
+  during verification) -> atomic `apply_batch`.
+- **Outcome.** Each run yields a `VerificationDecision` (`ACCEPT | REJECT`, stage,
+  reason code, verifier version, expected revision, passed stages) traced as
+  `VERIFY_RESULT`. A rejection never ingests, never makes result refs known/citable,
+  marks the WorkItem `FAILED` (dependents `SKIPPED_DEPENDENCY`), and is returned as
+  runtime feedback. Exceptions from the consumer verifier or ingestor reject
+  (`VERIFIER_ERROR`, `INGESTOR_ERROR`). Only an exact `True` passes; model prose and
+  status strings cannot override.
+- **Refs / visibility.** Declared result refs must be well-formed AGENT
+  `InformationRef`s, unique by id, and must not collide with a known ref or a hidden
+  task context ref. Ref-shaped mappings embedded in `structured_output` must be AGENT
+  and either declared by the result or already known. Existence of referenced
+  content stays a consumer `verify_result` responsibility (B1 contract).
+- **Ingestion.** A consumer `apply_batch` rejection after verification is traced as
+  `RESULT_INGESTION REJECTED` and leaves refs uncitable. An `apply_batch` return value
+  that differs from `store.revision()` is an `InvariantViolation` (run `FAILED`).
+  Each WorkBatch wave emits `INGESTION_ORDER` (`policy`, `wave`, `order`), and every
+  `RESULT_INGESTION` event carries its `sequence` in that order.
+- **Finish.** Before consumer `verify_finish`, the runtime checks
+  `structured_output` against `Task.output_schema` and requires every cited ref to be
+  a verified Agent-visible ref of the run (`VERIFY_FINISH`). A rejected finish is
+  feedback; the Main Agent may retry.
+- **Executor identity.** An untyped or misbound result is charged the full
+  reservation and rejected at `V0_IDENTITY` (previously a pre-verification denial).
+- Out of scope: model critic, engineering judgment, domain/TEP knowledge, SUBTASK
+  (B4). Pre-execution G0-G3 are not repeated.
