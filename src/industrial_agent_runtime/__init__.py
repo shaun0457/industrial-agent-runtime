@@ -14,7 +14,8 @@ from .hooks import (Executor, GateDecision, ModelProvider, RequestGate,
                     ResultIngestor, ResultVerifier)
 from .provider import FakeProvider
 from .gates import (DEFAULT_POLICY, ApprovalHook, FrozenRequest, GateDenied, GatePipeline,
-                    GatePolicy, GateStage, Reconciliation, ReferenceStateGuard, reconcile)
+                    GatePolicy, GateStage, Reconciliation, ReferenceStateGuard,
+                    ReservationOrigin, ReservationResolver, ResolvedReservation, reconcile)
 from .verification import (VERIFIER_VERSION, ResultVerificationPipeline,
                            VerificationDecision, VerificationRejected, VerificationStage,
                            VerifiedResult)
@@ -29,7 +30,8 @@ __all__ = [
     "ModelProvider", "ModelTurn", "RequestGate", "ResultIngestor", "ResultVerifier",
     "ToolCallRequest", "WorkBatch", "WorkItem",
     "DEFAULT_POLICY", "ApprovalHook", "FrozenRequest", "GateDenied", "GatePipeline",
-    "GatePolicy", "GateStage", "Reconciliation", "ReferenceStateGuard", "reconcile",
+    "GatePolicy", "GateStage", "Reconciliation", "ReferenceStateGuard",
+    "ReservationOrigin", "ReservationResolver", "ResolvedReservation", "reconcile",
     "VERIFIER_VERSION", "ResultVerificationPipeline", "VerificationDecision",
     "VerificationRejected", "VerificationStage", "VerifiedResult",
 ]

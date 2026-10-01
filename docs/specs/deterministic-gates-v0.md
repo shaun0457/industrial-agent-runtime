@@ -129,6 +129,10 @@ subagents += requested SUBTASK count
 
 If the request cannot fit remaining quota, deny before adapter execution.
 
+The reservation amount is the numeric declared draw, an exact request-bound value
+from a trusted `ReservationResolver`, or `max_budget_draw`; see "B2.1 — Request-bound
+budget reservation" for the hook, order, and validation.
+
 After execution, actual usage is reconciled against the reservation and recorded in trace/budget state. Adapters may not hide nested simulator/tool usage from declared configured dimensions.
 
 A model state-update proposal does not consume `max_tool_calls`; runtime-v0 accounts one `max_steps` unit for each accepted/rejected update proposal batch.
@@ -305,6 +309,103 @@ Adjudicated at the Batch-2 review closure; recorded in the program Decision Regi
   requires `max_budget_draw` and **reserves the maximum**.
 - Missing maximum → denied at G2 as `UNRESERVABLE_DRAW`.
 - Actual usage is reconciled after execution (see Reconciliation above).
+
+B2.1 (D-048, below) refines only the reservation *amount* for a string declaration
+when a trusted resolver supplies an exact value. D-037 is unchanged: the runtime
+still never parses or evaluates the string, and the maximum remains the fallback.
+
+## B2.1 — Request-bound budget reservation (D-048)
+
+Resolves C4 SC-5. Reserving `max_budget_draw` for every dynamic dimension is safe
+but over-reserves: a request whose real draw is far below the maximum can be denied
+although it fits the remaining quota. B2.1 lets a **trusted, application-supplied**
+component state the exact draw of one specific validated request.
+
+### Hook and order
+
+```text
+ToolCallRequest
+ -> G0 schema / refs
+ -> G1 allowlist / authority
+ -> G2a static sizing (D-037: numeric declared draw, else max_budget_draw)
+ -> G2b trusted request-bound resolution (ReservationResolver, dynamic dimensions only)
+ -> G2c validate resolved draw; check exact reservation against remaining quota
+ -> G3 side-effect policy (uses the resolved reservation)
+ -> consumer.validate_request
+ -> approval if required
+ -> FrozenRequest (carries the exact reservation and its per-dimension origin)
+ -> dispatch-time rebinding
+ -> Executor
+```
+
+```text
+ReservationResolver.resolve_reservation(
+    request: ToolCallRequest,   # already passed G0 and G1
+    spec: ToolSpec
+) -> map<dimension, number>
+```
+
+- The resolver is configured by the application (`Coordinator(reservation_resolver=...)`,
+  `GatePipeline(..., resolver=...)`). It is **never model-authored** and is distinct
+  from `RequestGate.validate_request`; `GateDecision` is not extended.
+- It is invoked only when the ToolSpec has at least one dynamic (string) declared
+  draw. Specs with only numeric/maximum-only draws never call it.
+- It receives only the validated request and the ToolSpec: no transcript, model
+  reasoning, task state, or budget usage. It must be a pure function of those inputs;
+  it must not execute tools, grant authority, mutate task/reference state, or
+  evaluate expressions.
+- It may return a subset of the dynamic dimensions. An omitted dimension falls back
+  to `max_budget_draw` (D-037).
+
+### Validation (all at `G2_BUDGET`, before any adapter call)
+
+| Condition | Reason code |
+|---|---|
+| resolver raises | `RESOLVER_ERROR` |
+| output is not a mapping with string keys | `INVALID_RESOLVER_OUTPUT` |
+| key not declared by the ToolSpec | `RESOLVED_DIMENSION_UNDECLARED` |
+| key is declared but not dynamic (numeric or maximum-only) | `RESOLVED_DIMENSION_NOT_DYNAMIC` |
+| value is not a finite non-negative number (incl. bool, NaN, ±Inf, negative) | `INVALID_RESOLVED_DRAW` |
+| value exceeds `max_budget_draw` | `RESOLVED_DRAW_EXCEEDS_MAX` |
+| dynamic dimension without `max_budget_draw` | `UNRESERVABLE_DRAW` (unchanged; checked first) |
+| exact reservation does not fit remaining quota | `BUDGET_EXHAUSTED` (unchanged) |
+| reservation recomputed at authorization differs from the preflight reservation | `RESERVATION_NOT_DETERMINISTIC` |
+
+### Reservation origin
+
+Every reserved dimension carries one origin:
+
+```text
+DECLARED       numeric declared_budget_draw (exact, static)
+REQUEST_BOUND  exact value from the trusted resolver for this request
+MAX_FALLBACK   dynamic declaration (or maximum-only dimension) reserved at max_budget_draw
+```
+
+`FrozenRequest.reservation_origins` and the `EXECUTE` trace event record the origin
+map next to the reserved amounts. No resolver internals are recorded.
+
+### Invariants
+
+- A smaller exact reservation never authorizes a request: G1, G3 (class, tags,
+  simulation classification/isolation), consumer validation, approval, and MUTATE
+  revision binding are evaluated exactly as before. G3's positive simulation-draw
+  requirement applies to the resolved reservation.
+- The reservation is computed before freeze and dispatched from `FrozenRequest`;
+  approval sees the same amounts and origins; it is never recomputed after freeze.
+  The Coordinator sizes each request in preflight and requires authorization to
+  reproduce exactly that reservation, so the resolver is called more than once per
+  request (twice for a single request, three times for a WorkBatch item) and must be
+  pure. A resolver whose answer drifts after WorkBatch preflight fails closed for that
+  item only (`RESERVATION_NOT_DETERMINISTIC`); under `ALL_SETTLED` already-dispatched
+  items stand and dependents are `SKIPPED_DEPENDENCY`. No item is ever dispatched with
+  a reservation other than the one counted in the cumulative preflight.
+- WorkBatch preflight sums the resolved per-item reservations (plus standard
+  counters) and denies the whole batch before any dispatch when the sum does not fit.
+- Reconciliation (B2/B3) is unchanged: actual usage is charged, overdraw and
+  unreserved/unreported dimensions are violations, adapter exceptions charge the
+  full (resolved) reservation, and violating results are not ingested.
+- Generic runtime interfaces name only ToolSpec resource dimensions; any domain
+  interpretation of request arguments belongs to the consumer's resolver.
 
 ### D-038 — Two revision domains
 
