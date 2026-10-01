@@ -218,11 +218,14 @@ class GatePipeline:
         raise GateDenied(self._decision(request_id, stage, reason_code, reason))
 
     # -- static stages (also used by WorkBatch preflight) ---------------------------------
-    def static_check(self, request: Any, known_refs: Mapping[str, InformationRef],
+    def static_check(self, request: Any, known_refs: Mapping[str, InformationRef], *,
+                     expected_reservation: ResolvedReservation | None = None,
                      ) -> tuple[ToolSpec, ResolvedReservation, list[GateDecision]]:
         """G0, G1, G2 reservation sizing (static + request-bound), and G3.
 
         No state or budget change; quota is checked separately by ``check_budget``.
+        ``expected_reservation`` (a preflight sizing) must be reproduced exactly; drift
+        is reported at G2 before G3 judges the resolved draw.
         """
         request_id = getattr(request, "request_id", "<untyped>")
         request_id = request_id if isinstance(request_id, str) else "<untyped>"
@@ -261,6 +264,9 @@ class GatePipeline:
                                         "tool, class, and tags explicitly granted", "ALLOW"))
 
         reservation = self.resolve(request, spec)
+        if expected_reservation is not None and expected_reservation != reservation:
+            self._deny(request_id, GateStage.G2_BUDGET, "RESERVATION_NOT_DETERMINISTIC",
+                       "reservation differs from the preflight reservation")
         decisions.append(self._side_effect(request_id, spec, reservation.draw))
         return spec, reservation, decisions
 
@@ -323,9 +329,10 @@ class GatePipeline:
         draw = self.reservation(request_id, spec)
         declared = spec.declared_budget_draw
         dynamic = {name for name, value in declared.items() if isinstance(value, str)}
-        exact = {name for name, value in declared.items() if not isinstance(value, str)}
-        origins = {name: ReservationOrigin.DECLARED if name in exact
-                   else ReservationOrigin.MAX_FALLBACK for name in draw}
+        # Only a numeric declaration is exact; string, None, or maximum-only -> max.
+        origins = {name: ReservationOrigin.MAX_FALLBACK
+                   if name in dynamic or declared.get(name) is None
+                   else ReservationOrigin.DECLARED for name in draw}
         if not dynamic or self.resolver is None:
             return ResolvedReservation(draw, origins)
         failure = None
@@ -414,11 +421,9 @@ class GatePipeline:
                   expected_reservation: ResolvedReservation | None = None) -> FrozenRequest:
         """Full pipeline. ``expected_reservation`` is the caller's preflight sizing,
         which authorization must reproduce exactly."""
-        spec, resolved, decisions = self.static_check(request, known_refs)
+        spec, resolved, decisions = self.static_check(
+            request, known_refs, expected_reservation=expected_reservation)
         request_id = request.request_id
-        if expected_reservation is not None and expected_reservation != resolved:
-            self._deny(request_id, GateStage.G2_BUDGET, "RESERVATION_NOT_DETERMINISTIC",
-                       "reservation differs from the preflight reservation")
         reservation = dict(resolved.draw)
         draw = {"tool_calls": 1, "steps": 1, **reservation}
         decisions.insert(2, self.check_budget(request_id, draw, usage))

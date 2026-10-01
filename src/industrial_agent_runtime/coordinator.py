@@ -202,10 +202,12 @@ class Coordinator:
         """
         request_id = getattr(request, "request_id", None)
         try:
-            spec, sized = self._request_supported(request)
+            # WorkBatch items were already sized and checked in batch preflight.
+            spec, sized = (self._request_supported(request) if preflight is None
+                           else (self.specs[request.tool_name], preflight))
             frozen = self.pipeline.authorize(
                 request, self.known_refs, self.usage, self.store.revision(),
-                expected_reservation=sized if preflight is None else preflight)
+                expected_reservation=sized)
             for decision in frozen.decisions:
                 self._event("GATE", decision.decision, inputs=request, outputs=decision, **ids)
             self.pipeline.check_dispatch(frozen, self.store.revision())

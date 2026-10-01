@@ -180,6 +180,23 @@ class RequestBoundReservationTests(unittest.TestCase):
             "rollouts": 1, "horizon": 3600, "cost": 5})
         self.assert_resolver_denies({"cost": 1}, "RESOLVED_DIMENSION_NOT_DYNAMIC")
 
+    def test_none_declared_draw_is_traced_as_max_fallback(self):
+        spec = replace(self.specs["fixed"], declared_budget_draw={"rollouts": None,
+                                                                  "horizon": 30})
+        resolved = self.pipeline().resolve(span("a", 1, "fixed"), spec)
+        self.assertEqual(dict(resolved.draw), {"rollouts": 2, "horizon": 30})
+        self.assertEqual(dict(resolved.origins),
+                         {"rollouts": "MAX_FALLBACK", "horizon": "DECLARED"})
+
+    def test_drift_is_reported_as_nondeterminism_before_g3(self):
+        self.specs["span"] = replace(self.specs["span"], declared_budget_draw={
+            "rollouts": "arguments.units", "horizon": "arguments.units"})
+        answers = iter([{"rollouts": 1, "horizon": 600}, {"rollouts": 0, "horizon": 0}])
+        self.resolver.fn = lambda request, spec: next(answers)
+        self.run_script([ask("a", 600), finish()])
+        self.assertEqual(self.denial(), ("G2_BUDGET", "RESERVATION_NOT_DETERMINISTIC"))
+        self.assertEqual(self.dispatched(), [])
+
     # 8 / 9 / 10 -----------------------------------------------------------------------
     def test_missing_resolver_or_omitted_dimension_reserves_the_maximum(self):
         for resolver in (None, Resolver(lambda request, spec: {})):
@@ -225,6 +242,7 @@ class RequestBoundReservationTests(unittest.TestCase):
         self.assertEqual((result.status, self.dispatched()), (TaskStatus.DONE, ["a", "b"]))
         self.assertEqual(self.g2_reserved(), [{"rollouts": 1, "horizon": 600}] * 2)
         self.assertEqual(result.budget_usage["horizon"], 1200)
+        self.assertEqual(self.resolver.calls, ["a", "b", "a", "b"])  # preflight + authorize
 
     def test_work_batch_with_failing_resolver_dispatches_nothing(self):
         def flaky(request, spec):

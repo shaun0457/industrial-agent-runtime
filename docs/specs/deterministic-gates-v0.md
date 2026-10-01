@@ -394,8 +394,8 @@ map next to the reserved amounts. No resolver internals are recorded.
   approval sees the same amounts and origins; it is never recomputed after freeze.
   The Coordinator sizes each request in preflight and requires authorization to
   reproduce exactly that reservation, so the resolver is called more than once per
-  request (twice for a single request, three times for a WorkBatch item) and must be
-  pure. A resolver whose answer drifts after WorkBatch preflight fails closed for that
+  request (twice: preflight sizing, then authorization) and must be pure; drift is
+  reported at G2 before G3 judges the resolved draw. A resolver whose answer drifts after WorkBatch preflight fails closed for that
   item only (`RESERVATION_NOT_DETERMINISTIC`); under `ALL_SETTLED` already-dispatched
   items stand and dependents are `SKIPPED_DEPENDENCY`. No item is ever dispatched with
   a reservation other than the one counted in the cumulative preflight.
@@ -404,6 +404,13 @@ map next to the reserved amounts. No resolver internals are recorded.
 - Reconciliation (B2/B3) is unchanged: actual usage is charged, overdraw and
   unreserved/unreported dimensions are violations, adapter exceptions charge the
   full (resolved) reservation, and violating results are not ingested.
+- Residual risk (accepted, no contract change): the `Executor` interface does not
+  receive the reservation, so the adapter/consumer must bound actual use to the
+  request it was given. An overdraw beyond the exact reservation remains a
+  reconciliation violation, is charged `max(actual, reserved)`, and is never
+  ingested; unknown actual use is charged the (exact) reservation as in B2.
+- A consumer `GateDecision.reserved_budget_draw`, when present, must equal the
+  resolved reservation (B2 rule unchanged).
 - Generic runtime interfaces name only ToolSpec resource dimensions; any domain
   interpretation of request arguments belongs to the consumer's resolver.
 

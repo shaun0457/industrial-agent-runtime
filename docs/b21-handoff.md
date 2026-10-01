@@ -14,7 +14,7 @@ budget reservation (D-048)". Resolves C4 SC-5; D-037 is unchanged.
   request and every WorkBatch item) must be reproduced exactly at authorization;
   the `EXECUTE` trace records `reserved` plus `reservation_origins`.
 - `GateDecision`, `RequestGate`, `reconcile`, and B3 verification are unchanged.
-- Tests: `tests/test_reservation.py` (21 tests) plus the unchanged B1–B3 suites.
+- Tests: `tests/test_reservation.py` (23 tests) plus the unchanged B1–B3 suites.
 
 ## Requirement mapping
 
@@ -44,12 +44,17 @@ budget reservation (D-048)". Resolves C4 SC-5; D-037 is unchanged.
   the resolved reservation, so a resolver that sizes every simulation dimension to
   zero is denied `SIMULATION_DRAW_UNDECLARED`.
 - `RESOLVER_ERROR` records only the exception type, not its message.
-- The resolver runs in preflight and again at authorization (2 calls per single
-  request, 3 per WorkBatch item); a non-reproducible answer is denied
-  `RESERVATION_NOT_DETERMINISTIC`. In a WorkBatch this fails only the drifting item
+- The resolver runs twice per request (preflight sizing, then authorization); a
+  non-reproducible answer is denied `RESERVATION_NOT_DETERMINISTIC` at G2, before G3. In a WorkBatch this fails only the drifting item
   (`test_work_batch_item_whose_reservation_drifts_fails_closed_alone`).
 - Origins are recorded on `FrozenRequest` and the `EXECUTE` event, not on the G2
   `GateDecision` (unchanged contract); a request denied before freeze has no origin
   map in the trace.
+
+- Residual risk: `Executor.execute(request, spec)` is unchanged and does not receive
+  the reservation, so adapters must bound actual use to the request. Overdraw beyond
+  an exact reservation is a reconciliation violation (charged, not ingested); an
+  adapter exception is charged the exact reservation. Tightening this would change
+  the frozen Executor contract and is out of B2.1 scope.
 
 No `SPEC_CONFLICT`.
