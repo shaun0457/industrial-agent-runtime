@@ -3,6 +3,7 @@
 from dataclasses import replace
 import tempfile
 import unittest
+import unittest.mock
 
 from industrial_agent_runtime import (
     Action, Budget, Coordinator, FakeProvider, FinishProposal, InformationRef, Reconciliation,
@@ -289,6 +290,50 @@ class FinishTests(Harness):
                  if e["status"] == "REJECTED"]
         self.assertEqual(codes, ["INVALID_FINAL_OUTPUT", "UNKNOWN_REF"])
         self.assertEqual(result.status, TaskStatus.DONE)
+
+
+class ReviewHardeningTests(Harness):
+    def test_untraceable_executor_output_rejects_only_that_result(self):
+        self.executor.execute = lambda call, spec: object()
+        result = self.one_call()
+        self.assertEqual(self.rejection(), ("V0_IDENTITY", "UNTYPED_RESULT"))
+        self.assertEqual(result.status, TaskStatus.DONE)
+
+    def test_forged_embedded_copy_of_a_known_ref_is_rejected(self):
+        self.executor.refs = (ref(),)
+        self.verifier.verify_result = lambda *args: True
+        forged = dict(to_jsonable(ref()), version="999")
+        self.spec = replace(self.spec, output_schema={"type": "object"})
+        self.returning(structured_output={"value": "x", "cite": forged})
+        self.assert_rejected("V3_REFS", "UNDECLARED_REF_IN_OUTPUT")
+        self.setUp()
+        self.executor.refs = (ref(),)
+        self.verifier.known_refs.add("obs-1")
+        self.spec = replace(self.spec, output_schema={"type": "object"})
+        self.returning(structured_output={"value": "x", "cite": to_jsonable(ref())})
+        self.one_call()
+        self.assertIn("obs-1", self.coordinator.known_refs)  # exact declared copy is fine
+
+    def test_unexpected_verification_error_is_a_rejection_not_a_run_failure(self):
+        original = Coordinator.__init__
+
+        def install(coordinator, *args, **kwargs):
+            original(coordinator, *args, **kwargs)
+            def broken(*a, **k):
+                raise RuntimeError("fixture store revision failure")
+            coordinator.verification.verify = broken
+        with unittest.mock.patch.object(Coordinator, "__init__", install):
+            result = self.one_call()
+        self.assertEqual(self.rejection(), ("VERIFICATION", "VERIFICATION_ERROR"))
+        self.assertEqual(result.status, TaskStatus.DONE)
+        self.assertEqual(self.store.data, {})
+
+    def test_consumer_finish_rejection_is_traced(self):
+        self.verifier.allow = False
+        self.run_script([finish(), finish()], verifier=self.verifier)
+        rejected = [e["output_summary"] for e in self.events("VERIFY_FINISH")]
+        self.assertEqual(rejected[0]["stage"], "CONSUMER")
+        self.assertEqual(rejected[0]["reason_code"], "CONSUMER_REJECTED")
 
 
 class PipelineUnitTests(unittest.TestCase):

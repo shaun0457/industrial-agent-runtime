@@ -26,7 +26,13 @@ from .protocols import TaskStateStore
 from .serialization import canonical_json, checksum, freeze_json
 from .trace import TraceRecorder
 from .verification import (INGESTION_ORDER_POLICY, ResultVerificationPipeline,
-                           VerificationRejected)
+                           VerificationDecision, VerificationRejected, VerificationStage)
+
+
+def _traceable(result: Any) -> Any:
+    """Untyped executor output is summarized so it can never break the trace."""
+    return result if isinstance(result, ToolResult) else {
+        "untyped_result": type(result).__name__}
 
 
 class Denied(ValueError):
@@ -234,23 +240,29 @@ class Coordinator:
         if error is not None:
             self._deny("EXECUTION", error, request_id=request.request_id, **ids)
             return None
-        self._event("TOOL_RESULT", "RETURNED", outputs=result, **ids)
+        self._event("TOOL_RESULT", "RETURNED", outputs=_traceable(result), **ids)
         return result, accounting
 
     def _ingest(self, request: ToolCallRequest, executed, sequence: int = 0,
                 **ids: Any) -> bool:
         """B3 verification, then atomic ingestion bound to the CURRENT revision."""
         result, accounting = executed
-        revision = self.store.revision()
-        reserved = {**self._context_refs, **self.known_refs}
+        revision = None
         try:
+            revision = self.store.revision()
+            reserved = {**self._context_refs, **self.known_refs}
             verified = self.verification.verify(
                 result, request, self.specs[request.tool_name], accounting, self.known_refs,
                 reserved, revision, self.store.revision)
-        except VerificationRejected as exc:
-            self._event("VERIFY_RESULT", "REJECTED", inputs=result, outputs=exc.decision, **ids)
+        except Exception as exc:  # any verification failure rejects only this result
+            decision = exc.decision if isinstance(exc, VerificationRejected) else \
+                VerificationDecision(request.request_id, "REJECT", "VERIFICATION",
+                                     "VERIFICATION_ERROR", str(exc),
+                                     expected_state_revision=revision)
+            self._event("VERIFY_RESULT", "REJECTED", inputs=_traceable(result),
+                        outputs=decision, **ids)
             self._deny("VERIFY_RESULT", str(exc), request_id=request.request_id,
-                       reason_code=exc.decision.reason_code, **ids)
+                       reason_code=decision.reason_code, **ids)
             return False
         self._event("VERIFY_RESULT", "ACCEPTED", inputs=result, outputs={
             "decision": verified.decision, "deltas": verified.deltas,
@@ -426,8 +438,24 @@ class Coordinator:
                         self._event("VERIFY_FINISH", "REJECTED", inputs=proposal,
                                     outputs=exc.decision)
                         raise Denied(str(exc)) from exc
-                    if self.verifier.verify_finish(proposal, self.task,
-                                                   self.store.revision()) is not True:
+                    revision = self.store.revision()
+                    try:
+                        verdict = self.verifier.verify_finish(proposal, self.task, revision)
+                    except Exception as exc:  # B1 semantics: the run fails closed
+                        self._event("VERIFY_FINISH", "REJECTED", inputs=proposal,
+                                    outputs=VerificationDecision(
+                                        self.task.task_id, "REJECT",
+                                        VerificationStage.CONSUMER.value, "VERIFIER_ERROR",
+                                        str(exc), expected_state_revision=revision))
+                        raise
+                    if verdict is not True:
+                        self._event("VERIFY_FINISH", "REJECTED", inputs=proposal,
+                                    outputs=VerificationDecision(
+                                        self.task.task_id, "REJECT",
+                                        VerificationStage.CONSUMER.value, "CONSUMER_REJECTED",
+                                        "consumer verify_finish did not return True",
+                                        expected_state_revision=revision,
+                                        passed_stages=decision.passed_stages))
                         raise Denied("consumer finish verification denied")
                     self._event("VERIFY_FINISH", "ACCEPTED", inputs=proposal, outputs=decision)
                     self._event("FINISH", "ACCEPTED", inputs=proposal)

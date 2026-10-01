@@ -15,7 +15,7 @@ from typing import Any
 
 from .actions import FinishProposal, ToolCallRequest
 from .contracts import InformationRef, Revision, StateDelta, Task, ToolResult, ToolSpec, Visibility
-from .gates import Reconciliation, ref_envelopes
+from .gates import _REF_FIELDS, Reconciliation, ref_envelopes
 from .hooks import ResultIngestor, ResultVerifier
 from .schema import instance_errors, schema_errors
 
@@ -123,10 +123,16 @@ def check_refs(run: _Run, refs: Sequence[Any], embedded: Sequence[Mapping[str, A
     for envelope in embedded:
         if envelope.get("visibility") != Visibility.AGENT.value:
             run.reject(stage, "HIDDEN_REF_IN_OUTPUT", "structured output embeds a non-AGENT ref")
-        ref_id = envelope.get("ref_id")
-        if not isinstance(ref_id, str) or (ref_id not in seen and ref_id not in known):
+        try:
+            if not set(envelope) <= _REF_FIELDS:
+                raise ValueError("unknown ref fields")
+            embedded_ref = InformationRef(**envelope)
+        except (TypeError, ValueError):
+            run.reject(stage, "MALFORMED_REF", "embedded ref is not a valid InformationRef")
+        # Same rule as the B2 gate: the whole envelope must equal the real ref.
+        if embedded_ref not in (seen.get(embedded_ref.ref_id), known.get(embedded_ref.ref_id)):
             run.reject(stage, "UNDECLARED_REF_IN_OUTPUT",
-                       "structured output embeds a ref that is neither declared nor known")
+                       "embedded ref is neither declared nor an exact known ref")
     return tuple(seen.values())
 
 

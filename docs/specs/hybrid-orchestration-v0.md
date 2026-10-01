@@ -383,3 +383,9 @@ and the `Coordinator` ingestion/finish paths. The B1 `ResultVerifier` and
   reservation and rejected at `V0_IDENTITY` (previously a pre-verification denial).
 - Out of scope: model critic, engineering judgment, domain/TEP knowledge, SUBTASK
   (B4). Pre-execution G0-G3 are not repeated.
+- **Review hardening.** Untyped executor output is summarized in the trace (never
+  breaks serialization) and rejected at `V0_IDENTITY`. Any unexpected exception during
+  verification rejects only that result (`VERIFICATION_ERROR`). Embedded ref
+  envelopes must equal the declared or known ref exactly (same rule as the B2 gate).
+  Consumer `verify_finish` rejections and errors are traced as `VERIFY_FINISH`
+  decisions; a `verify_finish` exception still fails the run (B1 semantics).
