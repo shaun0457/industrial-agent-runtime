@@ -197,6 +197,71 @@ class RequestBoundReservationTests(unittest.TestCase):
         self.assertEqual(self.denial(), ("G2_BUDGET", "RESERVATION_NOT_DETERMINISTIC"))
         self.assertEqual(self.dispatched(), [])
 
+    # stage precedence: G2 quota is evaluated (not just traced) before G3 ------------
+    def spy_stages(self):
+        order = []
+        def spy(stage, original):
+            def wrapper(pipeline, *args, **kwargs):
+                order.append(stage)
+                return original(pipeline, *args, **kwargs)
+            return wrapper
+        for name, stage in (("check_budget", "G2_BUDGET"),
+                            ("check_side_effect", "G3_SIDE_EFFECT")):
+            patcher = mock.patch.object(GatePipeline, name,
+                                        spy(stage, getattr(GatePipeline, name)))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return order
+
+    def test_g2_quota_denial_precedes_a_g3_simulation_denial(self):
+        g3_failures = {
+            "NO_ISOLATION_GUARANTEE": replace(self.specs["span"], isolation_guarantee="NONE"),
+            "SIMULATION_MISCLASSIFIED": replace(self.specs["span"], side_effect_class=S.COMPUTE),
+            "REFERENCE_GUARD_REQUIRED": self.specs["span"],
+        }
+        for code, spec in g3_failures.items():
+            for horizon, expected, stages in (
+                    (600, ("G3_SIDE_EFFECT", code), ["G2_BUDGET", "G3_SIDE_EFFECT"]),
+                    (599, ("G2_BUDGET", "BUDGET_EXHAUSTED"), ["G2_BUDGET"])):
+                with self.subTest(code=code, horizon=horizon):
+                    self.setUp()
+                    order = self.spy_stages()
+                    self.specs["span"] = spec
+                    self.set_budget(horizon=horizon)  # 600 fits; 599 also exceeds quota
+                    guard = None if code == "REFERENCE_GUARD_REQUIRED" else self.guard
+                    self.run_script([ask("a", 600), finish()], reference_guard=guard)
+                    self.assertEqual(self.denial(), expected)
+                    self.assertEqual(order, stages)  # G3 never evaluated on a G2 denial
+                    self.assertEqual((self.dispatched(), self.gate.revisions), ([], []))
+
+    def test_evaluation_order_matches_trace_order(self):
+        order = self.spy_stages()
+        self.run_script([ask("a", 600), finish()])
+        stages = [e["output_summary"]["stage"] for e in self.events("GATE")]
+        self.assertEqual(stages, ["G0_SCHEMA", "G1_AUTHORITY", "G2_BUDGET",
+                                  "G3_SIDE_EFFECT", "consumer"])
+        self.assertEqual(order, ["G2_BUDGET", "G3_SIDE_EFFECT"])
+        self.assertEqual(self.dispatched(), ["a"])
+
+    def test_work_batch_cumulative_g2_denial_precedes_item_g3_denial(self):
+        batch = WorkBatch("b", "", (WorkItem("w1", "TOOL", (), span("a", 600)),
+                                    WorkItem("w2", "TOOL", (), span("b", 600, "fixed"))))
+        for horizon, expected, stages in (
+                (1200, "G3_SIDE_EFFECT/NO_ISOLATION_GUARANTEE",
+                 ["G2_BUDGET", "G3_SIDE_EFFECT", "G3_SIDE_EFFECT"]),
+                (1199, "G2_BUDGET/BUDGET_EXHAUSTED", ["G2_BUDGET"])):
+            with self.subTest(horizon=horizon):
+                self.setUp()
+                self.specs["fixed"] = replace(self.specs["span"], name="fixed",
+                                              isolation_guarantee="NONE")
+                order = self.spy_stages()
+                self.set_budget(horizon=horizon)  # each item fits alone; 1199 < sum
+                self.run_script([scripted(Action.WORK_BATCH, work_batch=batch), finish()])
+                reason = self.events("WORK_BATCH")[0]["output_summary"]["reason"]
+                self.assertIn(expected, reason)
+                self.assertEqual(order, stages)
+                self.assertEqual((self.dispatched(), self.gate.revisions), ([], []))
+
     # 8 / 9 / 10 -----------------------------------------------------------------------
     def test_missing_resolver_or_omitted_dimension_reserves_the_maximum(self):
         for resolver in (None, Resolver(lambda request, spec: {})):

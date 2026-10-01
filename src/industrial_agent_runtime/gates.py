@@ -55,11 +55,18 @@ class ReferenceStateGuard(Protocol):
 class ReservationResolver(Protocol):
     def resolve_reservation(self, request: ToolCallRequest,
                             spec: ToolSpec) -> Mapping[str, float]:
-        """Exact draw for some dynamic (string-declared) dimensions of this request.
+        """Request-bound reservations for some dynamic (string-declared) dimensions.
+
+        Each value is a deterministic, sound upper bound on the use of any conforming
+        execution of this specific request, not a prediction of actual use (actual
+        use may be lower; it is reconciled after execution). It must be finite,
+        nonnegative, and <= ``max_budget_draw``. Omit a dimension whose bound cannot
+        be soundly derived; it then reserves ``max_budget_draw`` (D-037). Never return
+        probabilistic or optimistic estimates.
 
         Trusted application code, never model-authored. Must be a pure function of
         the validated request and ToolSpec: no tool execution, state mutation,
-        authority grant, or expression evaluation. Omitted dimensions reserve the max.
+        authority grant, or expression evaluation.
         """
         ...
 
@@ -72,7 +79,7 @@ class ReservationOrigin(StrEnum):
 
 @dataclass(frozen=True)
 class ResolvedReservation:
-    """Exact per-dimension reservation and where each amount came from."""
+    """The per-dimension amounts G2 admits and reserves, and where each came from."""
 
     draw: Mapping[str, float]
     origins: Mapping[str, str]  # dimension -> ReservationOrigin value
@@ -221,11 +228,11 @@ class GatePipeline:
     def static_check(self, request: Any, known_refs: Mapping[str, InformationRef], *,
                      expected_reservation: ResolvedReservation | None = None,
                      ) -> tuple[ToolSpec, ResolvedReservation, list[GateDecision]]:
-        """G0, G1, G2 reservation sizing (static + request-bound), and G3.
+        """G0, G1, then G2 reservation sizing (static + request-bound) and validation.
 
-        No state or budget change; quota is checked separately by ``check_budget``.
-        ``expected_reservation`` (a preflight sizing) must be reproduced exactly; drift
-        is reported at G2 before G3 judges the resolved draw.
+        No state or budget change. Callers must run the G2 quota check
+        (``check_budget``) and only then G3 (``check_side_effect``).
+        ``expected_reservation`` (a preflight sizing) must be reproduced exactly.
         """
         request_id = getattr(request, "request_id", "<untyped>")
         request_id = request_id if isinstance(request_id, str) else "<untyped>"
@@ -267,7 +274,6 @@ class GatePipeline:
         if expected_reservation is not None and expected_reservation != reservation:
             self._deny(request_id, GateStage.G2_BUDGET, "RESERVATION_NOT_DETERMINISTIC",
                        "reservation differs from the preflight reservation")
-        decisions.append(self._side_effect(request_id, spec, reservation.draw))
         return spec, reservation, decisions
 
     def _check_refs(self, request_id, arguments, known_refs):
@@ -365,7 +371,9 @@ class GatePipeline:
             draw[name], origins[name] = value, ReservationOrigin.REQUEST_BOUND
         return ResolvedReservation(draw, origins)
 
-    def _side_effect(self, request_id, spec, reservation) -> GateDecision:
+    def check_side_effect(self, request_id: str, spec: ToolSpec,
+                          reservation: Mapping[str, float]) -> GateDecision:
+        """G3 on a reservation that has already passed the G2 quota check."""
         cls = spec.side_effect_class
         simulated = {name for name, amount in reservation.items()
                      if name in self.policy.simulation_dimensions}
@@ -426,7 +434,8 @@ class GatePipeline:
         request_id = request.request_id
         reservation = dict(resolved.draw)
         draw = {"tool_calls": 1, "steps": 1, **reservation}
-        decisions.insert(2, self.check_budget(request_id, draw, usage))
+        decisions.append(self.check_budget(request_id, draw, usage))  # G2 quota before G3
+        decisions.append(self.check_side_effect(request_id, spec, reservation))
         reference_revision = None
         if self.reference_guard is not None:
             reference_revision = self.reference_guard.reference_revision()

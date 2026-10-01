@@ -182,7 +182,7 @@ class Coordinator:
 
     def _request_supported(self, request: ToolCallRequest,
                            ) -> tuple[ToolSpec, ResolvedReservation]:
-        """Static G0/G1/G3 checks plus exact reservation sizing; no state or budget change."""
+        """G0/G1 plus G2 reservation sizing; no state or budget change, no G3 yet."""
         spec, reservation, _ = self.pipeline.static_check(request, self.known_refs)
         if request.request_id in self._request_ids:
             raise Denied("request_id already dispatched; use a new explicit request")
@@ -307,13 +307,15 @@ class Coordinator:
             raise Denied("duplicate work_id")
         request_ids = set()
         reserved: dict[str, float] = {}
+        specs: dict[str, ToolSpec] = {}
         sized: dict[str, ResolvedReservation] = {}
         for item in batch.items:
             if item.kind != "TOOL":
                 raise Denied("SUBTASK execution requires downstream B4 implementation")
             if item.status != "PENDING":
                 raise Denied("model may not pre-complete work")
-            _, sized[item.work_id] = self._request_supported(item.request_or_subtask)
+            specs[item.work_id], sized[item.work_id] = self._request_supported(
+                item.request_or_subtask)
             for name, amount in sized[item.work_id].draw.items():
                 reserved[name] = reserved.get(name, 0) + amount
             request_id = item.request_or_subtask.request_id
@@ -343,9 +345,13 @@ class Coordinator:
         for name in sorted({"tool_calls", "steps", *self.task.budget.extra_dimensions}):
             if sum(item.budget_request.get(name, 0) for item in batch.items) > self._remaining(name):
                 raise Denied("cumulative WorkItem budget exceeds remaining quota")
-        # Cumulative G2 preflight: all exact item reservations must fit together.
+        # Cumulative G2 preflight: all request-bound item reservations must fit
+        # together. Only then is G3 judged, in stable item order (stage precedence).
         self.pipeline.check_budget(batch.batch_id, {
             "tool_calls": len(items), "steps": len(items), **reserved}, self.usage)
+        for item in batch.items:
+            self.pipeline.check_side_effect(item.request_or_subtask.request_id,
+                                            specs[item.work_id], sized[item.work_id].draw)
         return sized
 
     def _batch(self, batch: WorkBatch) -> None:

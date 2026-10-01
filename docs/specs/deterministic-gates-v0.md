@@ -129,8 +129,8 @@ subagents += requested SUBTASK count
 
 If the request cannot fit remaining quota, deny before adapter execution.
 
-The reservation amount is the numeric declared draw, an exact request-bound value
-from a trusted `ReservationResolver`, or `max_budget_draw`; see "B2.1 — Request-bound
+The reservation amount is the numeric declared draw, a sound request-bound upper
+bound from a trusted `ReservationResolver`, or `max_budget_draw`; see "B2.1 — Request-bound
 budget reservation" for the hook, order, and validation.
 
 After execution, actual usage is reconciled against the reservation and recorded in trace/budget state. Adapters may not hide nested simulator/tool usage from declared configured dimensions.
@@ -311,17 +311,47 @@ Adjudicated at the Batch-2 review closure; recorded in the program Decision Regi
 - Actual usage is reconciled after execution (see Reconciliation above).
 
 B2.1 (D-048, below) refines only the reservation *amount* for a string declaration
-when a trusted resolver supplies an exact value. D-037 is unchanged: the runtime
-still never parses or evaluates the string, and the maximum remains the fallback.
+when a trusted resolver supplies a sound request-bound upper bound. D-037 is
+unchanged: the runtime still never parses or evaluates the string, and the maximum
+remains the fallback.
 
 ## B2.1 — Request-bound budget reservation (D-048)
 
 Resolves C4 SC-5. Reserving `max_budget_draw` for every dynamic dimension is safe
-but over-reserves: a request whose real draw is far below the maximum can be denied
-although it fits the remaining quota. B2.1 lets a **trusted, application-supplied**
-component state the exact draw of one specific validated request.
+but over-reserves: a request whose conforming execution is bounded far below the
+maximum can be denied although it fits the remaining quota. B2.1 lets a **trusted,
+application-supplied** component state a request-bound reservation for one specific
+validated request.
+
+### Meaning of a request-bound reservation
+
+A request-bound reservation is a **deterministic amount derived from the specific
+request that soundly upper-bounds the resource use of any conforming execution of
+that request**. It is not a prediction of actual consumption. It is exact only in
+the sense that it is the precise amount G2 admits and reserves.
+
+```text
+requested horizon   = 600 seconds
+reservation         = 600 seconds   (REQUEST_BOUND; admitted by G2)
+actual successful   = 450 seconds   (charged at reconciliation; 150 released)
+```
+
+- Actual usage may be lower than the reservation.
+- Normal conforming execution must not exceed it. Exceeding it is a reconciliation
+  violation (see Invariants).
+- The resolver derives the bound only from its trusted allowed inputs (the validated
+  request and the ToolSpec).
+- The bound is finite, non-negative, and `<= max_budget_draw`.
+- If the resolver cannot derive a sound upper bound for a dynamic dimension, it
+  **MUST omit that dimension**, which keeps the D-037 `max_budget_draw` fallback.
+- Probabilistic, typical-case, or otherwise optimistic estimates are not valid
+  request-bound reservations and must never be used for G2 admission.
 
 ### Hook and order
+
+This is the actual evaluation order. Denial precedence follows it: a request that
+fails both the G2 quota and a G3 rule is denied at `G2_BUDGET`, and G3 is not
+evaluated.
 
 ```text
 ToolCallRequest
@@ -329,35 +359,41 @@ ToolCallRequest
  -> G1 allowlist / authority
  -> G2a static sizing (D-037: numeric declared draw, else max_budget_draw)
  -> G2b trusted request-bound resolution (ReservationResolver, dynamic dimensions only)
- -> G2c validate resolved draw; check exact reservation against remaining quota
- -> G3 side-effect policy (uses the resolved reservation)
+ -> G2c validate the resolved bound; check the reservation against remaining quota
+ -> G3 side-effect policy (judged on the reservation that passed G2)
  -> consumer.validate_request
  -> approval if required
- -> FrozenRequest (carries the exact reservation and its per-dimension origin)
+ -> FrozenRequest (carries the admitted reservation and its per-dimension origin)
  -> dispatch-time rebinding
  -> Executor
 ```
+
+In code, `GatePipeline.static_check` runs G0, G1, G2a, and G2b plus resolved-bound
+validation. `GatePipeline.check_budget` runs the G2 quota check, and only then
+`GatePipeline.check_side_effect` runs G3. `authorize` runs that sequence for one
+request. WorkBatch preflight sizes every item (G0–G2b) and runs the cumulative G2
+quota check, then G3 for every item in stable item order, all before any dispatch.
 
 ```text
 ReservationResolver.resolve_reservation(
     request: ToolCallRequest,   # already passed G0 and G1
     spec: ToolSpec
-) -> map<dimension, number>
+) -> map<dimension, number>     # sound request-bound upper bounds
 ```
 
 - The resolver is configured by the application (`Coordinator(reservation_resolver=...)`,
   `GatePipeline(..., resolver=...)`). It is **never model-authored** and is distinct
   from `RequestGate.validate_request`; `GateDecision` is not extended.
 - It is invoked only when the ToolSpec has at least one dynamic (string) declared
-  draw. Specs with only numeric/maximum-only draws never call it.
+  draw. Specs with only numeric or maximum-only draws never call it.
 - It receives only the validated request and the ToolSpec: no transcript, model
-  reasoning, task state, or budget usage. It must be a pure function of those inputs;
-  it must not execute tools, grant authority, mutate task/reference state, or
-  evaluate expressions.
+  reasoning, task state, or budget usage. It must be a pure function of those
+  inputs. It must not execute tools, grant authority, mutate task/reference state,
+  or evaluate expressions.
 - It may return a subset of the dynamic dimensions. An omitted dimension falls back
   to `max_budget_draw` (D-037).
 
-### Validation (all at `G2_BUDGET`, before any adapter call)
+### Validation (all at `G2_BUDGET`, before G3 and before any adapter call)
 
 | Condition | Reason code |
 |---|---|
@@ -368,17 +404,17 @@ ReservationResolver.resolve_reservation(
 | value is not a finite non-negative number (incl. bool, NaN, ±Inf, negative) | `INVALID_RESOLVED_DRAW` |
 | value exceeds `max_budget_draw` | `RESOLVED_DRAW_EXCEEDS_MAX` |
 | dynamic dimension without `max_budget_draw` | `UNRESERVABLE_DRAW` (unchanged; checked first) |
-| exact reservation does not fit remaining quota | `BUDGET_EXHAUSTED` (unchanged) |
 | reservation recomputed at authorization differs from the preflight reservation | `RESERVATION_NOT_DETERMINISTIC` |
+| reservation does not fit remaining quota | `BUDGET_EXHAUSTED` (unchanged) |
 
 ### Reservation origin
 
 Every reserved dimension carries one origin:
 
 ```text
-DECLARED       numeric declared_budget_draw (exact, static)
-REQUEST_BOUND  exact value from the trusted resolver for this request
-MAX_FALLBACK   dynamic declaration (or maximum-only dimension) reserved at max_budget_draw
+DECLARED       numeric declared_budget_draw (static)
+REQUEST_BOUND  request-bound upper bound from the trusted resolver for this request
+MAX_FALLBACK   dynamic declaration (or None / maximum-only) reserved at max_budget_draw
 ```
 
 `FrozenRequest.reservation_origins` and the `EXECUTE` trace event record the origin
@@ -386,32 +422,39 @@ map next to the reserved amounts. No resolver internals are recorded.
 
 ### Invariants
 
-- A smaller exact reservation never authorizes a request: G1, G3 (class, tags,
-  simulation classification/isolation), consumer validation, approval, and MUTATE
-  revision binding are evaluated exactly as before. G3's positive simulation-draw
-  requirement applies to the resolved reservation.
-- The reservation is computed before freeze and dispatched from `FrozenRequest`;
-  approval sees the same amounts and origins; it is never recomputed after freeze.
-  The Coordinator sizes each request in preflight and requires authorization to
-  reproduce exactly that reservation, so the resolver is called more than once per
-  request (twice: preflight sizing, then authorization) and must be pure; drift is
-  reported at G2 before G3 judges the resolved draw. A resolver whose answer drifts after WorkBatch preflight fails closed for that
-  item only (`RESERVATION_NOT_DETERMINISTIC`); under `ALL_SETTLED` already-dispatched
-  items stand and dependents are `SKIPPED_DEPENDENCY`. No item is ever dispatched with
-  a reservation other than the one counted in the cumulative preflight.
+- A smaller request-bound reservation never authorizes a request. G1, G3 (class,
+  tags, simulation classification/isolation), consumer validation, approval, and
+  MUTATE revision binding are evaluated exactly as before. G3's positive
+  simulation-draw requirement applies to the resolved reservation.
+- The reservation is computed before freeze and dispatched from `FrozenRequest`.
+  Approval sees the same amounts and origins, and the reservation is never
+  recomputed after freeze.
+- The Coordinator sizes each request in preflight and requires authorization to
+  reproduce exactly that reservation. The resolver is therefore called twice per
+  request (preflight sizing, then authorization) and must be pure. Drift is
+  reported at G2.
+- A resolver whose answer drifts after WorkBatch preflight fails closed for that
+  item only (`RESERVATION_NOT_DETERMINISTIC`). Under `ALL_SETTLED`, already
+  dispatched items stand and dependents are `SKIPPED_DEPENDENCY`. No item is ever
+  dispatched with a reservation other than the one counted in the cumulative
+  preflight.
 - WorkBatch preflight sums the resolved per-item reservations (plus standard
-  counters) and denies the whole batch before any dispatch when the sum does not fit.
-- Reconciliation (B2/B3) is unchanged: actual usage is charged, overdraw and
-  unreserved/unreported dimensions are violations, adapter exceptions charge the
-  full (resolved) reservation, and violating results are not ingested.
-- Residual risk (accepted, no contract change): the `Executor` interface does not
-  receive the reservation, so the adapter/consumer must bound actual use to the
-  request it was given. An overdraw beyond the exact reservation remains a
+  counters). It denies the whole batch before any dispatch, and before any G3
+  evaluation, when the sum does not fit.
+- Reconciliation (B2/B3) is unchanged:
+  - actual usage is charged, so a lower actual use releases the remainder;
+  - an overdraw beyond the reservation and unreserved/unreported dimensions are
+    violations;
+  - an adapter exception is charged the full (resolved) reservation;
+  - violating results are not ingested.
+- Accepted v0 residual: `Executor.execute(request, spec)` does not receive the
+  reservation. Trusted adapters are expected to obey the bounded request semantics.
+  A successful overdraw beyond the request-bound reservation remains a
   reconciliation violation, is charged `max(actual, reserved)`, and is never
-  ingested; unknown actual use is charged the (exact) reservation as in B2.
+  ingested. Unknown actual use is charged the resolved reservation, as in B2.
 - A consumer `GateDecision.reserved_budget_draw`, when present, must equal the
   resolved reservation (B2 rule unchanged).
-- Generic runtime interfaces name only ToolSpec resource dimensions; any domain
+- Generic runtime interfaces name only ToolSpec resource dimensions. Any domain
   interpretation of request arguments belongs to the consumer's resolver.
 
 ### D-038 — Two revision domains
