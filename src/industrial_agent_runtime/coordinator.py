@@ -2,8 +2,10 @@
 
 Execution is fail-closed without trusted gate, Executor, verifier, and ingestion
 hooks. Every executable request passes the B2 GatePipeline (G0-G3, consumer
-validate_request, approval) and is re-bound immediately before dispatch.
-Post-execution verification beyond B2 reconciliation remains B3; SUBTASK is B4.
+validate_request, approval) and is re-bound immediately before dispatch. Every
+returned result passes the B3 ResultVerificationPipeline before deterministic
+ingestion; a rejection never ingests and never makes result refs citable.
+SUBTASK is B4.
 """
 
 from collections.abc import Callable, Mapping, Sequence
@@ -23,6 +25,14 @@ from .hooks import Executor, ModelProvider, RequestGate, ResultIngestor, ResultV
 from .protocols import TaskStateStore
 from .serialization import canonical_json, checksum, freeze_json
 from .trace import TraceRecorder
+from .verification import (INGESTION_ORDER_POLICY, ResultVerificationPipeline,
+                           VerificationDecision, VerificationRejected, VerificationStage)
+
+
+def _traceable(result: Any) -> Any:
+    """Untyped executor output is summarized so it can never break the trace."""
+    return result if isinstance(result, ToolResult) else {
+        "untyped_result": type(result).__name__}
 
 
 class Denied(ValueError):
@@ -68,6 +78,7 @@ class Coordinator:
         self.pipeline = GatePipeline(task, self.specs, gate_policy or DEFAULT_POLICY,
                                      gate, approval, reference_guard)
         self.reference_guard = reference_guard
+        self.verification = ResultVerificationPipeline(verifier, ingestor)
         self.policy = freeze_json(projection_policy or {})
         self.clock = clock or (lambda: datetime.now(timezone.utc).isoformat())
         self.usage = {"model_calls": 0, "tool_calls": 0, "steps": 0, "subagents": 0,
@@ -178,7 +189,8 @@ class Coordinator:
     def _reference_revision(self) -> Revision | None:
         return None if self.reference_guard is None else self.reference_guard.reference_revision()
 
-    def _execute(self, request: ToolCallRequest, **ids: Any) -> ToolResult | None:
+    def _execute(self, request: ToolCallRequest, **ids: Any):
+        """Authorize, dispatch once, and reconcile. Returns (result, accounting) or None."""
         request_id = getattr(request, "request_id", None)
         try:
             spec, _ = self._request_supported(request)
@@ -211,12 +223,12 @@ class Coordinator:
         result, error = None, None
         try:
             result = self.executor.execute(request, spec)
-            if not isinstance(result, ToolResult) or result.request_id != request.request_id:
-                raise Denied("executor returned malformed/misbound result")
         except Exception as exc:
             result, error = None, str(exc)
-        # Unknown actual use (adapter failure) is charged at the full reservation.
-        accounting = reconcile(reserved, result.actual_budget_draw if result else reserved,
+        # Unknown actual use (adapter failure or an untyped/misbound result) is charged
+        # at the full reservation; identity itself is judged by B3 verification.
+        bound = isinstance(result, ToolResult) and result.request_id == request.request_id
+        accounting = reconcile(reserved, result.actual_budget_draw if bound else reserved,
                                self.task.budget)
         for name, amount in accounting.charged.items():
             self.usage[name] += amount
@@ -228,49 +240,50 @@ class Coordinator:
         if error is not None:
             self._deny("EXECUTION", error, request_id=request.request_id, **ids)
             return None
-        self._event("TOOL_RESULT", "RETURNED", outputs=result, **ids)
-        if accounting.violations:
-            self._deny("EXECUTION", "RECONCILIATION_VIOLATION: " + "; ".join(accounting.violations),
-                       request_id=request.request_id, **ids)
-            return None
-        return result
+        self._event("TOOL_RESULT", "RETURNED", outputs=_traceable(result), **ids)
+        return result, accounting
 
-    def _ingest(self, request: ToolCallRequest, result: ToolResult, **ids: Any) -> bool:
+    def _ingest(self, request: ToolCallRequest, executed, sequence: int = 0,
+                **ids: Any) -> bool:
+        """B3 verification, then atomic ingestion bound to the CURRENT revision."""
+        result, accounting = executed
+        revision = None
         try:
-            if result.status != "SUCCESS":
-                raise Denied("tool did not succeed")
-            if any(ref.visibility != Visibility.AGENT
-                   for ref in (*result.information_refs, *result.artifact_refs)):
-                raise Denied("result exposes hidden reference")
-            refs = (*result.information_refs, *result.artifact_refs)
-            # Hidden task context refs are reserved ids: a result cannot re-publish one
-            # as AGENT-visible under the same id.
-            if any(self.known_refs.get(ref.ref_id, self._context_refs.get(ref.ref_id, ref)) != ref
-                   for ref in refs):
-                raise Denied("result ref conflicts with a known or context ref of the same id")
             revision = self.store.revision()
-            deltas = tuple(replace(delta, producer="RESULT_INGESTION",
-                                   proposed_base_revision=revision)
-                           for delta in self.ingestor.derive_deltas(result))
-            if self.verifier.verify_result(result, request, self.specs[request.tool_name],
-                                           deltas, revision) is not True:
-                raise Denied("post-execution verification denied")
-            if self.store.revision() != revision:
-                raise Denied("state changed during verification/ingestion preparation")
-            self._event("VERIFY_RESULT", "ACCEPTED", inputs=result, outputs={
-                "deltas": deltas, "expected_revision": revision}, **ids)
-            new_revision = (self.store.apply_batch(deltas, expected_revision=revision)
-                            if deltas else revision)
-            for ref in refs:  # verified Agent-visible refs become citable in later requests
-                self.known_refs.setdefault(ref.ref_id, ref)
-            self._event("RESULT_INGESTION", "ACCEPTED", inputs={
-                "deltas": deltas, "expected_revision": revision},
-                outputs={"resulting_revision": new_revision, "order": "work_id_lexical_per_wave"},
-                **ids)
-            return True
-        except Exception as exc:
-            self._deny("VERIFY_RESULT", str(exc), request_id=request.request_id, **ids)
+            reserved = {**self._context_refs, **self.known_refs}
+            verified = self.verification.verify(
+                result, request, self.specs[request.tool_name], accounting, self.known_refs,
+                reserved, revision, self.store.revision)
+        except Exception as exc:  # any verification failure rejects only this result
+            decision = exc.decision if isinstance(exc, VerificationRejected) else \
+                VerificationDecision(request.request_id, "REJECT", "VERIFICATION",
+                                     "VERIFICATION_ERROR", str(exc),
+                                     expected_state_revision=revision)
+            self._event("VERIFY_RESULT", "REJECTED", inputs=_traceable(result),
+                        outputs=decision, **ids)
+            self._deny("VERIFY_RESULT", str(exc), request_id=request.request_id,
+                       reason_code=decision.reason_code, **ids)
             return False
+        self._event("VERIFY_RESULT", "ACCEPTED", inputs=result, outputs={
+            "decision": verified.decision, "deltas": verified.deltas,
+            "expected_revision": revision}, **ids)
+        ingestion = {"deltas": verified.deltas, "expected_revision": revision,
+                     "order_policy": INGESTION_ORDER_POLICY, "sequence": sequence}
+        try:
+            new_revision = (self.store.apply_batch(verified.deltas, expected_revision=revision)
+                            if verified.deltas else revision)
+        except Exception as exc:  # consumer rejected the verified batch: nothing applied
+            self._event("RESULT_INGESTION", "REJECTED", inputs=ingestion,
+                        outputs={"error": str(exc)}, **ids)
+            self._deny("RESULT_INGESTION", str(exc), request_id=request.request_id, **ids)
+            return False
+        if new_revision != self.store.revision():
+            raise InvariantViolation("apply_batch returned a revision that differs from the store")
+        for ref in verified.refs:  # verified Agent-visible refs become citable in later requests
+            self.known_refs.setdefault(ref.ref_id, ref)
+        self._event("RESULT_INGESTION", "ACCEPTED", inputs=ingestion,
+                    outputs={"resulting_revision": new_revision}, **ids)
+        return True
 
     def _validate_batch(self, batch: WorkBatch) -> None:
         if batch.completion_policy != "ALL_SETTLED":
@@ -327,6 +340,7 @@ class Coordinator:
             return
         pending = {item.work_id: item for item in batch.items}
         outcomes: dict[str, str] = {}
+        wave = 0
         while pending:
             ready = sorted(key for key, item in pending.items()
                            if all(dependency in outcomes for dependency in item.depends_on))
@@ -341,9 +355,15 @@ class Coordinator:
                 collected.append((key, item.request_or_subtask, result))
             # The sequential executor is permitted by OQ-3. All results from a
             # scheduling wave are collected before deterministic lexical ingestion.
+            wave += 1
+            order = [key for key, _, result in collected if result is not None]
+            if order:
+                self._event("INGESTION_ORDER", "PLANNED", batch_id=batch.batch_id, outputs={
+                    "policy": INGESTION_ORDER_POLICY, "wave": wave, "order": order})
             for key, request, result in collected:
                 success = result is not None and self._ingest(
-                    request, result, batch_id=batch.batch_id, work_id=key)
+                    request, result, order.index(key) if result is not None else -1,
+                    batch_id=batch.batch_id, work_id=key)
                 outcomes[key] = "COMPLETED" if success else "FAILED"
                 self._event("WORK_ITEM", outcomes[key], batch_id=batch.batch_id, work_id=key)
         self.feedback.append({"stage": "WORK_BATCH", "batch_id": batch.batch_id,
@@ -409,11 +429,35 @@ class Coordinator:
                     self._batch(turn.work_batch)
                 elif turn.action == Action.FINISH_PROPOSAL:
                     proposal = turn.finish_proposal
-                    if (self.verifier is None or any(ref.visibility != Visibility.AGENT for ref in
-                            (*proposal.information_refs, *proposal.artifact_refs))
-                            or self.verifier.verify_finish(proposal, self.task, self.store.revision())
-                            is not True):
-                        raise Denied("finish structural verification denied")
+                    if self.verifier is None:
+                        raise Denied("finish requires a trusted result verifier")
+                    try:
+                        decision = self.verification.verify_finish(
+                            proposal, self.task, self.known_refs, self.store.revision())
+                    except VerificationRejected as exc:
+                        self._event("VERIFY_FINISH", "REJECTED", inputs=proposal,
+                                    outputs=exc.decision)
+                        raise Denied(str(exc)) from exc
+                    revision = self.store.revision()
+                    try:
+                        verdict = self.verifier.verify_finish(proposal, self.task, revision)
+                    except Exception as exc:  # B1 semantics: the run fails closed
+                        self._event("VERIFY_FINISH", "REJECTED", inputs=proposal,
+                                    outputs=VerificationDecision(
+                                        self.task.task_id, "REJECT",
+                                        VerificationStage.CONSUMER.value, "VERIFIER_ERROR",
+                                        str(exc), expected_state_revision=revision))
+                        raise
+                    if verdict is not True:
+                        self._event("VERIFY_FINISH", "REJECTED", inputs=proposal,
+                                    outputs=VerificationDecision(
+                                        self.task.task_id, "REJECT",
+                                        VerificationStage.CONSUMER.value, "CONSUMER_REJECTED",
+                                        "consumer verify_finish did not return True",
+                                        expected_state_revision=revision,
+                                        passed_stages=decision.passed_stages))
+                        raise Denied("consumer finish verification denied")
+                    self._event("VERIFY_FINISH", "ACCEPTED", inputs=proposal, outputs=decision)
                     self._event("FINISH", "ACCEPTED", inputs=proposal)
                     output, self.status = proposal.structured_output, TaskStatus.DONE
                 else:

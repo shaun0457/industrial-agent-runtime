@@ -15,6 +15,9 @@ from .hooks import (Executor, GateDecision, ModelProvider, RequestGate,
 from .provider import FakeProvider
 from .gates import (DEFAULT_POLICY, ApprovalHook, FrozenRequest, GateDenied, GatePipeline,
                     GatePolicy, GateStage, Reconciliation, ReferenceStateGuard, reconcile)
+from .verification import (VERIFIER_VERSION, ResultVerificationPipeline,
+                           VerificationDecision, VerificationRejected, VerificationStage,
+                           VerifiedResult)
 
 __all__ = [
     "Budget", "ContextProjection", "InformationRef", "ModelStateUpdateProposal",
@@ -27,4 +30,6 @@ __all__ = [
     "ToolCallRequest", "WorkBatch", "WorkItem",
     "DEFAULT_POLICY", "ApprovalHook", "FrozenRequest", "GateDenied", "GatePipeline",
     "GatePolicy", "GateStage", "Reconciliation", "ReferenceStateGuard", "reconcile",
+    "VERIFIER_VERSION", "ResultVerificationPipeline", "VerificationDecision",
+    "VerificationRejected", "VerificationStage", "VerifiedResult",
 ]

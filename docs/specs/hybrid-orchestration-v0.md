@@ -343,3 +343,69 @@ MCP is not an orchestration dependency; if used later, it is only one possible e
 11. Post-execution `verify_result` rejects a result/final claim referencing a nonexistent artifact/ref.
 12. Same ModelTurn/WorkBatch plus deterministic tool results produces identical state-update/scheduling/verification/ingestion trace.
 13. Runtime package operates without LangGraph or MCP installed.
+
+## B3 implementation notes (v0)
+
+Implemented in `industrial_agent_runtime.verification` (`ResultVerificationPipeline`)
+and the `Coordinator` ingestion/finish paths. The B1 `ResultVerifier` and
+`ResultIngestor` protocols are unchanged; no new consumer hook is added.
+
+- **Stage order.** `V0_IDENTITY` (typed `ToolResult`, `request_id` bound to the
+  dispatched request, status `SUCCESS`) -> `V1_PROVENANCE` -> `V2_OUTPUT_SCHEMA`
+  (B2 schema subset against `ToolSpec.output_schema`) -> `V3_REFS` -> `V4_ACCOUNTING`
+  (B2 reconciliation must be violation-free) -> `V5_INGESTION_STRUCTURE`
+  (consumer `derive_deltas` yields well-formed `StateDelta`s with AGENT-only reason
+  refs; producer forced to `RESULT_INGESTION`; `proposed_base_revision` = CURRENT
+  revision) -> consumer `verify_result(...) is True` -> `V6_REVISION` (state unchanged
+  during verification) -> atomic `apply_batch`.
+- **Outcome.** Each run yields a `VerificationDecision` (`ACCEPT | REJECT`, stage,
+  reason code, verifier version, expected revision, passed stages) traced as
+  `VERIFY_RESULT`. A rejection never ingests, never makes result refs known/citable,
+  marks the WorkItem `FAILED` (dependents `SKIPPED_DEPENDENCY`), and is returned as
+  runtime feedback. Exceptions from the consumer verifier or ingestor reject
+  (`VERIFIER_ERROR`, `INGESTOR_ERROR`). Only an exact `True` passes; model prose and
+  status strings cannot override.
+- **Refs / visibility.** Declared result refs must be well-formed AGENT
+  `InformationRef`s, unique by id, and must not collide with a known ref or a hidden
+  task context ref. Ref-shaped mappings embedded in `structured_output` must be AGENT
+  and either declared by the result or already known. Existence of referenced
+  content stays a consumer `verify_result` responsibility (B1 contract).
+- **Ingestion.** A consumer `apply_batch` rejection after verification is traced as
+  `RESULT_INGESTION REJECTED` and leaves refs uncitable. An `apply_batch` return value
+  that differs from `store.revision()` is an `InvariantViolation` (run `FAILED`).
+  Each WorkBatch wave emits `INGESTION_ORDER` (`policy`, `wave`, `order`), and every
+  `RESULT_INGESTION` event carries its `sequence` in that order.
+- **Finish.** Before consumer `verify_finish`, the runtime checks
+  `structured_output` against `Task.output_schema` and requires every cited ref to be
+  a verified Agent-visible ref of the run (`VERIFY_FINISH`). A rejected finish is
+  feedback; the Main Agent may retry.
+- **Executor identity.** An untyped or misbound result is charged the full
+  reservation and rejected at `V0_IDENTITY` (previously a pre-verification denial).
+- Out of scope: model critic, engineering judgment, domain/TEP knowledge, SUBTASK
+  (B4). Pre-execution G0-G3 are not repeated.
+- **Review hardening.** Untyped executor output is summarized in the trace (never
+  breaks serialization) and rejected at `V0_IDENTITY`. Any unexpected exception during
+  verification rejects only that result (`VERIFICATION_ERROR`). Embedded ref
+  envelopes must equal the declared or known ref exactly (same rule as the B2 gate).
+  Consumer `verify_finish` rejections and errors are traced as `VERIFY_FINISH`
+  decisions; a `verify_finish` exception still fails the run (B1 semantics).
+
+### Accepted Batch-3 decisions
+
+Recorded in the program Decision Register (`tep-sim/docs/ecosystem/decision-register.md`).
+
+- **D-039** — `ResultVerifier.verify_result(...) -> bool` is retained for v0; a
+  non-`True` verdict is `CONSUMER/CONSUMER_REJECTED`. No verifier decision hook.
+- **D-040** — Minimum generic tool provenance: `provenance.tool_version` is
+  mandatory and nonempty. If `ToolSpec.provider_metadata["tool_version"]` is a
+  nonempty string, the result must equal it, else `V1_PROVENANCE/TOOL_VERSION_MISMATCH`.
+  Optional `request_id`/`tool_name` must exactly match when present. Deeper
+  provenance validation is consumer-owned.
+- **D-041** — Content/artifact existence is consumer-owned (`verify_result`); no
+  storage resolver hook. A result or finish proposal must not declare a `ref_id`
+  more than once, even as an exact duplicate (`DUPLICATE_REF_ID`). A non-null
+  result-ingestion `StateDelta.reason_ref` must be a valid AGENT `InformationRef`
+  (`HIDDEN_REASON_REF` otherwise) that exactly matches a ref of the result being
+  verified or an already-known verified/context ref (`UNKNOWN_REASON_REF`).
+- **D-042** — Finish verification uses the same deterministic B2 schema subset for
+  `Task.output_schema`; unsupported keywords fail closed.
