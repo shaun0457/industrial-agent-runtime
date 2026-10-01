@@ -1,7 +1,8 @@
 """B2 deterministic pre-execution gates (docs/specs/deterministic-gates-v0.md).
 
-G0 schema -> G1 allowlist/authority -> G2 budget/reservation -> G3 side-effect
--> consumer validate_request -> optional approval -> frozen request.
+G0 schema -> G1 allowlist/authority -> G2 budget/reservation (static sizing, trusted
+request-bound resolution, quota) -> G3 side-effect -> consumer validate_request ->
+optional approval -> frozen request.
 
 Every stage yields a GateDecision. Any denial, unknown policy, or gate error
 prevents dispatch. The runtime stays domain-free: which extra budget dimensions
@@ -9,7 +10,7 @@ represent simulation work is consumer configuration, not runtime knowledge.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import math
 from typing import Any, Protocol
@@ -49,6 +50,43 @@ class ReferenceStateGuard(Protocol):
     def reference_revision(self) -> Revision:
         """Current revision/version of the consumer's reference (non-sandbox) state."""
         ...
+
+
+class ReservationResolver(Protocol):
+    def resolve_reservation(self, request: ToolCallRequest,
+                            spec: ToolSpec) -> Mapping[str, float]:
+        """Request-bound reservations for some dynamic (string-declared) dimensions.
+
+        Each value is a deterministic, sound upper bound on the use of any conforming
+        execution of this specific request, not a prediction of actual use (actual
+        use may be lower; it is reconciled after execution). It must be finite,
+        nonnegative, and <= ``max_budget_draw``. Omit a dimension whose bound cannot
+        be soundly derived; it then reserves ``max_budget_draw`` (D-037). Never return
+        probabilistic or optimistic estimates.
+
+        Trusted application code, never model-authored. Must be a pure function of
+        the validated request and ToolSpec: no tool execution, state mutation,
+        authority grant, or expression evaluation.
+        """
+        ...
+
+
+class ReservationOrigin(StrEnum):
+    DECLARED = "DECLARED"
+    REQUEST_BOUND = "REQUEST_BOUND"
+    MAX_FALLBACK = "MAX_FALLBACK"
+
+
+@dataclass(frozen=True)
+class ResolvedReservation:
+    """The per-dimension amounts G2 admits and reserves, and where each came from."""
+
+    draw: Mapping[str, float]
+    origins: Mapping[str, str]  # dimension -> ReservationOrigin value
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "draw", freeze_json(self.draw))
+        object.__setattr__(self, "origins", freeze_json(self.origins))
 
 
 class ApprovalHook(Protocol):
@@ -141,10 +179,12 @@ class FrozenRequest:
     expected_reference_revision: Revision | None
     policy_version: str
     decisions: tuple[GateDecision, ...] = field(default=())
+    reservation_origins: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "reserved_budget_draw", freeze_json(self.reserved_budget_draw))
         object.__setattr__(self, "decisions", tuple(self.decisions))
+        object.__setattr__(self, "reservation_origins", freeze_json(self.reservation_origins))
 
 
 def _finite(value: Any) -> bool:
@@ -166,12 +206,14 @@ class GatePipeline:
 
     def __init__(self, task: Task, specs: Mapping[str, ToolSpec], policy: GatePolicy,
                  consumer: RequestGate | None, approval: ApprovalHook | None,
-                 reference_guard: ReferenceStateGuard | None) -> None:
+                 reference_guard: ReferenceStateGuard | None, *,
+                 resolver: ReservationResolver | None = None) -> None:
         collisions = set(task.budget.extra_dimensions) & STANDARD_DIMENSIONS
         if collisions:
             raise ValueError(f"extra dimensions shadow standard counters: {sorted(collisions)}")
         self.task, self.specs, self.policy = task, specs, policy
         self.consumer, self.approval, self.reference_guard = consumer, approval, reference_guard
+        self.resolver = resolver
 
     # -- decisions ---------------------------------------------------------------------
     def _decision(self, request_id: str, stage: GateStage, reason_code: str, reason: str,
@@ -183,9 +225,15 @@ class GatePipeline:
         raise GateDenied(self._decision(request_id, stage, reason_code, reason))
 
     # -- static stages (also used by WorkBatch preflight) ---------------------------------
-    def static_check(self, request: Any, known_refs: Mapping[str, InformationRef],
-                     ) -> tuple[ToolSpec, dict[str, float], list[GateDecision]]:
-        """G0, G1, static G2 reservation sizing, and G3. No state or budget change."""
+    def static_check(self, request: Any, known_refs: Mapping[str, InformationRef], *,
+                     expected_reservation: ResolvedReservation | None = None,
+                     ) -> tuple[ToolSpec, ResolvedReservation, list[GateDecision]]:
+        """G0, G1, then G2 reservation sizing (static + request-bound) and validation.
+
+        No state or budget change. Callers must run the G2 quota check
+        (``check_budget``) and only then G3 (``check_side_effect``).
+        ``expected_reservation`` (a preflight sizing) must be reproduced exactly.
+        """
         request_id = getattr(request, "request_id", "<untyped>")
         request_id = request_id if isinstance(request_id, str) else "<untyped>"
         if not isinstance(request, ToolCallRequest):
@@ -222,8 +270,10 @@ class GatePipeline:
         decisions.append(self._decision(request_id, GateStage.G1_AUTHORITY, "AUTHORIZED",
                                         "tool, class, and tags explicitly granted", "ALLOW"))
 
-        reservation = self.reservation(request_id, spec)
-        decisions.append(self._side_effect(request_id, spec, reservation))
+        reservation = self.resolve(request, spec)
+        if expected_reservation is not None and expected_reservation != reservation:
+            self._deny(request_id, GateStage.G2_BUDGET, "RESERVATION_NOT_DETERMINISTIC",
+                       "reservation differs from the preflight reservation")
         return spec, reservation, decisions
 
     def _check_refs(self, request_id, arguments, known_refs):
@@ -275,7 +325,55 @@ class GatePipeline:
             reserved[name] = amount
         return reserved
 
-    def _side_effect(self, request_id, spec, reservation) -> GateDecision:
+    def resolve(self, request: ToolCallRequest, spec: ToolSpec) -> ResolvedReservation:
+        """D-037 static sizing refined by the trusted request-bound resolver (D-048).
+
+        Only string-declared dimensions may be resolved; the string itself is never
+        read. Every resolved value is validated against the ToolSpec maximum.
+        """
+        request_id = request.request_id
+        draw = self.reservation(request_id, spec)
+        declared = spec.declared_budget_draw
+        dynamic = {name for name, value in declared.items() if isinstance(value, str)}
+        # Only a numeric declaration is exact; string, None, or maximum-only -> max.
+        origins = {name: ReservationOrigin.MAX_FALLBACK
+                   if name in dynamic or declared.get(name) is None
+                   else ReservationOrigin.DECLARED for name in draw}
+        if not dynamic or self.resolver is None:
+            return ResolvedReservation(draw, origins)
+        failure = None
+        try:
+            resolved = self.resolver.resolve_reservation(request, spec)
+            if isinstance(resolved, Mapping):
+                resolved = dict(resolved.items())
+        except Exception as exc:  # a resolver that cannot answer denies
+            failure = type(exc).__name__  # never the message: consumer internals
+        if failure is not None:
+            self._deny(request_id, GateStage.G2_BUDGET, "RESOLVER_ERROR",
+                       f"reservation resolver failed: {failure}")
+        if not isinstance(resolved, dict) or any(not isinstance(k, str) for k in resolved):
+            self._deny(request_id, GateStage.G2_BUDGET, "INVALID_RESOLVER_OUTPUT",
+                       "reservation resolver must return a mapping of dimension names")
+        for name in sorted(resolved):
+            value = resolved[name]
+            if name not in draw:
+                self._deny(request_id, GateStage.G2_BUDGET, "RESOLVED_DIMENSION_UNDECLARED",
+                           f"{name} is not declared by the ToolSpec")
+            if name not in dynamic:
+                self._deny(request_id, GateStage.G2_BUDGET, "RESOLVED_DIMENSION_NOT_DYNAMIC",
+                           f"{name} is not a dynamic declared draw")
+            if not _finite(value):
+                self._deny(request_id, GateStage.G2_BUDGET, "INVALID_RESOLVED_DRAW",
+                           f"resolved draw for {name} is not a finite nonnegative number")
+            if value > spec.max_budget_draw[name]:
+                self._deny(request_id, GateStage.G2_BUDGET, "RESOLVED_DRAW_EXCEEDS_MAX",
+                           f"resolved draw for {name} exceeds its maximum")
+            draw[name], origins[name] = value, ReservationOrigin.REQUEST_BOUND
+        return ResolvedReservation(draw, origins)
+
+    def check_side_effect(self, request_id: str, spec: ToolSpec,
+                          reservation: Mapping[str, float]) -> GateDecision:
+        """G3 on a reservation that has already passed the G2 quota check."""
         cls = spec.side_effect_class
         simulated = {name for name, amount in reservation.items()
                      if name in self.policy.simulation_dimensions}
@@ -327,11 +425,17 @@ class GatePipeline:
 
     # -- full authorization -----------------------------------------------------------
     def authorize(self, request: ToolCallRequest, known_refs: Mapping[str, InformationRef],
-                  usage: Mapping[str, float], state_revision: Revision) -> FrozenRequest:
-        spec, reservation, decisions = self.static_check(request, known_refs)
+                  usage: Mapping[str, float], state_revision: Revision, *,
+                  expected_reservation: ResolvedReservation | None = None) -> FrozenRequest:
+        """Full pipeline. ``expected_reservation`` is the caller's preflight sizing,
+        which authorization must reproduce exactly."""
+        spec, resolved, decisions = self.static_check(
+            request, known_refs, expected_reservation=expected_reservation)
         request_id = request.request_id
+        reservation = dict(resolved.draw)
         draw = {"tool_calls": 1, "steps": 1, **reservation}
-        decisions.insert(2, self.check_budget(request_id, draw, usage))
+        decisions.append(self.check_budget(request_id, draw, usage))  # G2 quota before G3
+        decisions.append(self.check_side_effect(request_id, spec, reservation))
         reference_revision = None
         if self.reference_guard is not None:
             reference_revision = self.reference_guard.reference_revision()
@@ -360,7 +464,7 @@ class GatePipeline:
                        "consumer reservation differs from the runtime reservation")
         frozen = FrozenRequest(request, checksum(spec), spec.side_effect_class, reservation,
                                state_revision, reference_revision, self.policy.policy_version,
-                               tuple(decisions))
+                               tuple(decisions), resolved.origins)
         needs_approval = (consumer.decision == "REQUIRE_APPROVAL"
                           or spec.side_effect_class in self.policy.approval_required_for)
         if needs_approval:
@@ -371,9 +475,7 @@ class GatePipeline:
             decisions.append(self._decision(
                 request_id, GateStage.APPROVAL, "APPROVED", "frozen request approved", "ALLOW",
                 expected_state_revision=state_revision))
-            frozen = FrozenRequest(request, frozen.spec_checksum, frozen.side_effect_class,
-                                   reservation, state_revision, reference_revision,
-                                   self.policy.policy_version, tuple(decisions))
+            frozen = replace(frozen, decisions=tuple(decisions))
         return frozen
 
     def check_dispatch(self, frozen: FrozenRequest, state_revision: Revision) -> None:

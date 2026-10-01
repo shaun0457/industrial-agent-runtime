@@ -125,6 +125,8 @@ ToolSpec
   provider_metadata?
 ```
 
+An `expression` declaration is never evaluated by the runtime (D-037). It reserves `max_budget_draw` unless a trusted application `ReservationResolver` supplies a validated request-bound reservation: a sound upper bound for a conforming execution of the specific request, not a prediction of actual use (D-048; see `deterministic-gates-v0.md`, B2.1).
+
 A compound tool must expose the resource dimensions it can consume. If one call can internally trigger simulator rollouts, the ToolSpec must be `SIMULATE` and declare/reserve the relevant rollout/horizon/trial draw before dispatch.
 
 ### `ToolCallRequest`

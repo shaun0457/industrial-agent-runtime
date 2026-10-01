@@ -20,7 +20,8 @@ from .contracts import (ContextProjection, InformationRef, Revision, RuntimeResu
                         SideEffectClass, StateDelta, Task, TaskStatus, ToolResult,
                         ToolSpec, TraceEvent, Visibility)
 from .gates import (DEFAULT_POLICY, STANDARD_DIMENSIONS, ApprovalHook, GateDenied,
-                    GatePipeline, GatePolicy, ReferenceStateGuard, reconcile)
+                    GatePipeline, GatePolicy, ReferenceStateGuard, ReservationResolver,
+                    ResolvedReservation, reconcile)
 from .hooks import Executor, ModelProvider, RequestGate, ResultIngestor, ResultVerifier
 from .protocols import TaskStateStore
 from .serialization import canonical_json, checksum, freeze_json
@@ -64,6 +65,7 @@ class Coordinator:
                  gate_policy: GatePolicy | None = None,
                  approval: ApprovalHook | None = None,
                  reference_guard: ReferenceStateGuard | None = None,
+                 reservation_resolver: ReservationResolver | None = None,
                  projection_policy: Mapping[str, Any] | None = None,
                  clock: Callable[[], str] | None = None) -> None:
         self.task, self.store, self.provider, self.trace = task, store, provider, trace
@@ -76,7 +78,8 @@ class Coordinator:
                 raise ValueError(f"model metadata requires {key}")
         self.gate, self.executor, self.verifier, self.ingestor = gate, executor, verifier, ingestor
         self.pipeline = GatePipeline(task, self.specs, gate_policy or DEFAULT_POLICY,
-                                     gate, approval, reference_guard)
+                                     gate, approval, reference_guard,
+                                     resolver=reservation_resolver)
         self.reference_guard = reference_guard
         self.verification = ResultVerificationPipeline(verifier, ingestor)
         self.policy = freeze_json(projection_policy or {})
@@ -177,8 +180,9 @@ class Coordinator:
                      "resulting_revision": current}, budget_delta={"steps": 1})
         return True
 
-    def _request_supported(self, request: ToolCallRequest) -> tuple[ToolSpec, dict[str, float]]:
-        """Static G0/G1/G3 checks plus reservation sizing; no state or budget change."""
+    def _request_supported(self, request: ToolCallRequest,
+                           ) -> tuple[ToolSpec, ResolvedReservation]:
+        """G0/G1 plus G2 reservation sizing; no state or budget change, no G3 yet."""
         spec, reservation, _ = self.pipeline.static_check(request, self.known_refs)
         if request.request_id in self._request_ids:
             raise Denied("request_id already dispatched; use a new explicit request")
@@ -189,13 +193,21 @@ class Coordinator:
     def _reference_revision(self) -> Revision | None:
         return None if self.reference_guard is None else self.reference_guard.reference_revision()
 
-    def _execute(self, request: ToolCallRequest, **ids: Any):
-        """Authorize, dispatch once, and reconcile. Returns (result, accounting) or None."""
+    def _execute(self, request: ToolCallRequest, *,
+                 preflight: ResolvedReservation | None = None, **ids: Any):
+        """Authorize, dispatch once, and reconcile. Returns (result, accounting) or None.
+
+        ``preflight`` is the WorkBatch-preflight reservation; authorization must
+        reproduce it exactly, so the batch-level G2 check stays valid per item.
+        """
         request_id = getattr(request, "request_id", None)
         try:
-            spec, _ = self._request_supported(request)
-            frozen = self.pipeline.authorize(request, self.known_refs, self.usage,
-                                             self.store.revision())
+            # WorkBatch items were already sized and checked in batch preflight.
+            spec, sized = (self._request_supported(request) if preflight is None
+                           else (self.specs[request.tool_name], preflight))
+            frozen = self.pipeline.authorize(
+                request, self.known_refs, self.usage, self.store.revision(),
+                expected_reservation=sized)
             for decision in frozen.decisions:
                 self._event("GATE", decision.decision, inputs=request, outputs=decision, **ids)
             self.pipeline.check_dispatch(frozen, self.store.revision())
@@ -218,7 +230,9 @@ class Coordinator:
         reserved = frozen.reserved_budget_draw
         self._charge(tool_calls=1, steps=1)
         self._request_ids.add(request.request_id)
-        self._event("EXECUTE", "DISPATCHED", inputs={"request": request, "reserved": reserved},
+        self._event("EXECUTE", "DISPATCHED", inputs={
+            "request": request, "reserved": reserved,
+            "reservation_origins": frozen.reservation_origins},
                     budget_delta={"tool_calls": 1, "steps": 1}, **ids)
         result, error = None, None
         try:
@@ -285,7 +299,7 @@ class Coordinator:
                     outputs={"resulting_revision": new_revision}, **ids)
         return True
 
-    def _validate_batch(self, batch: WorkBatch) -> None:
+    def _validate_batch(self, batch: WorkBatch) -> dict[str, ResolvedReservation]:
         if batch.completion_policy != "ALL_SETTLED":
             raise Denied("unsupported completion_policy")
         items = {item.work_id: item for item in batch.items}
@@ -293,13 +307,16 @@ class Coordinator:
             raise Denied("duplicate work_id")
         request_ids = set()
         reserved: dict[str, float] = {}
+        specs: dict[str, ToolSpec] = {}
+        sized: dict[str, ResolvedReservation] = {}
         for item in batch.items:
             if item.kind != "TOOL":
                 raise Denied("SUBTASK execution requires downstream B4 implementation")
             if item.status != "PENDING":
                 raise Denied("model may not pre-complete work")
-            _, draw = self._request_supported(item.request_or_subtask)
-            for name, amount in draw.items():
+            specs[item.work_id], sized[item.work_id] = self._request_supported(
+                item.request_or_subtask)
+            for name, amount in sized[item.work_id].draw.items():
                 reserved[name] = reserved.get(name, 0) + amount
             request_id = item.request_or_subtask.request_id
             if request_id in request_ids:
@@ -328,13 +345,18 @@ class Coordinator:
         for name in sorted({"tool_calls", "steps", *self.task.budget.extra_dimensions}):
             if sum(item.budget_request.get(name, 0) for item in batch.items) > self._remaining(name):
                 raise Denied("cumulative WorkItem budget exceeds remaining quota")
-        # Cumulative G2 preflight: all declared item reservations must fit together.
+        # Cumulative G2 preflight: all request-bound item reservations must fit
+        # together. Only then is G3 judged, in lexical work_id order (stage precedence).
         self.pipeline.check_budget(batch.batch_id, {
             "tool_calls": len(items), "steps": len(items), **reserved}, self.usage)
+        for key in sorted(items):
+            self.pipeline.check_side_effect(items[key].request_or_subtask.request_id,
+                                            specs[key], sized[key].draw)
+        return sized
 
     def _batch(self, batch: WorkBatch) -> None:
         try:
-            self._validate_batch(batch)
+            sized = self._validate_batch(batch)
         except Exception as exc:
             self._deny("WORK_BATCH", str(exc), batch_id=batch.batch_id)
             return
@@ -351,7 +373,8 @@ class Coordinator:
                     outcomes[key] = "SKIPPED_DEPENDENCY"
                     self._event("WORK_ITEM", outcomes[key], batch_id=batch.batch_id, work_id=key)
                     continue
-                result = self._execute(item.request_or_subtask, batch_id=batch.batch_id, work_id=key)
+                result = self._execute(item.request_or_subtask, preflight=sized[key],
+                                       batch_id=batch.batch_id, work_id=key)
                 collected.append((key, item.request_or_subtask, result))
             # The sequential executor is permitted by OQ-3. All results from a
             # scheduling wave are collected before deterministic lexical ingestion.
