@@ -16,6 +16,8 @@ Choose the first real adapter based on:
 
 Provider choice is an adapter/experiment decision, not architecture.
 
+Before the first real-provider run, go through the checklist in [`thesis-mas-lessons.md`](thesis-mas-lessons.md). It covers transport timeout/retry/fallback, the fail-closed paths, and the non-existent-entity trap. The list comes from failures verified in the predecessor multi-agent system.
+
 ## OQ-2 — Subagent depth/limit
 
 Initial proposal remains depth 1 and cumulative max 3 children per task. Change only from measured quality/context/cost results.
