@@ -35,7 +35,7 @@ ADR-002 took option 2 for v0 and kept an entry point for option 1:
 | L7 | Only the CLI path had a checkpointer; the API path could not resume | Reference loop only; persistent checkpoint backend is OQ-4 | **Open** |
 | L8 | No human approval interrupt | Authority-escalation interface is OQ-5, needed only for MUTATE | **Open** (not needed for read-only blind RCA) |
 | L9 | Stall detection was literal dedup only; 15 of 180 thesis runs hit the 50-turn cap (Debate protocol 31.1 %) | Hard budgets in the Coordinator; semantic stop policy is OQ-8 | **Open**. Add a stall or oscillation metric |
-| L10 | Strictly sequential delegation | Dependency-aware `WorkBatch` with parallel ready items | Closed (TOOL items). SUBTASK execution is still fail-closed until the consumer integration lands |
+| L10 | Strictly sequential delegation | Dependency-aware `WorkBatch` scheduled in waves | Partly closed (TOOL items): dependencies are checked and ready items are grouped into waves, but the executor runs each wave sequentially (OQ-3). SUBTASK execution is still fail-closed until the consumer integration lands |
 | L11 | Correctness was never measured: a keyword gate and a dry run only; eval questions contained the answer (fault ID) | Owned by the consumer: tep-agent-lab `evaluation-v0.md`, `d0-benchmark-contract.md` (blind cases, LeakageAudit, mandatory C0 baseline) | Covered by the consumer specs; real-LLM runs not done yet |
 
 ## Checks to run when the first real provider lands
