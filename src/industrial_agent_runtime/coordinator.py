@@ -13,7 +13,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import math
-from typing import Any
+from typing import Any, NoReturn
 
 from .actions import Action, ModelTurn, ToolCallRequest, WorkBatch
 from .contracts import (ContextProjection, InformationRef, Revision, RuntimeResult,
@@ -22,7 +22,9 @@ from .contracts import (ContextProjection, InformationRef, Revision, RuntimeResu
 from .gates import (DEFAULT_POLICY, STANDARD_DIMENSIONS, ApprovalHook, GateDenied,
                     GatePipeline, GatePolicy, ReferenceStateGuard, ReservationResolver,
                     ResolvedReservation, reconcile)
-from .hooks import Executor, ModelProvider, RequestGate, ResultIngestor, ResultVerifier
+from .hooks import (Executor, ModelProvider, ModelUsage, ProviderError, ProviderOutputError,
+                    ProviderResponse, RequestGate, ResultIngestor, ResultVerifier,
+                    is_error_code)
 from .protocols import TaskStateStore
 from .serialization import canonical_json, checksum, freeze_json
 from .trace import TraceRecorder
@@ -44,6 +46,13 @@ class InvariantViolation(RuntimeError):
     """A breached runtime invariant; the run fails closed instead of continuing."""
 
 
+def _provider_raised(exc: BaseException) -> str:
+    return f"PROVIDER_ERROR: provider raised {type(exc).__name__}"
+
+
+USAGE_OVER_BUDGET = ("PROVIDER_USAGE_OVER_BUDGET: provider reported more attempts than "
+                     "the model-call budget allowed")
+
 TERMINAL_STATUSES = frozenset({TaskStatus.DONE, TaskStatus.FAILED,
                              TaskStatus.EXHAUSTED, TaskStatus.CANCELLED})
 
@@ -52,7 +61,9 @@ class Coordinator:
     """One single-writer run with a consumer state store and bounded fake model.
 
     Side-effect authority comes only from the trusted ``gate_policy`` (default:
-    READ/COMPUTE). SUBTASK and token-metered providers remain fail-closed.
+    READ/COMPUTE). SUBTASK and token-metered tasks remain fail-closed. Provider
+    usage, malformed-output rejection and provider failures follow runtime-v0
+    "Provider usage and errors".
     """
 
     def __init__(self, task: Task, store: TaskStateStore, provider: ModelProvider,
@@ -113,6 +124,44 @@ class Coordinator:
 
     def _remaining(self, dimension: str) -> float:
         return GatePipeline.remaining(self.task.budget, self.usage, dimension)
+
+    def _account(self, usage: ModelUsage) -> None:
+        """Charge and trace reported retries; over-reporting fails the run.
+
+        The provider was told the remaining budget, so reporting more attempts
+        means its accounting cannot be trusted. The reported spend is still
+        recorded, beyond the limit, so the trace shows what was actually used.
+        """
+        retries = usage.attempts - 1
+        over = retries > self._remaining("model_calls")
+        self.usage["model_calls"] += retries
+        self._event("MODEL_USAGE", "OVER_BUDGET" if over else "REPORTED", outputs=usage,
+                    budget_delta={"model_calls": retries} if retries else None,
+                    latency=float(usage.latency_seconds))
+        if over:
+            raise RuntimeError(USAGE_OVER_BUDGET)
+
+    def _provider_failure(self, exc: ProviderError) -> NoReturn:
+        """Map a provider error to a rejected turn or a failed run, by code only.
+
+        Neither str(exc) nor a code that fails the format check is ever recorded,
+        so an adapter subclass cannot carry upstream text into results or trace.
+        """
+        try:
+            code, usage = exc.code, exc.usage
+        except Exception:
+            code, usage = None, None
+        if not is_error_code(code):
+            raise RuntimeError(_provider_raised(exc)) from None
+        if isinstance(usage, ModelUsage):
+            self._account(usage)
+        if isinstance(exc, ProviderOutputError):
+            raise Denied(code) from None  # malformed reply: reject the turn, tell the model
+        raise RuntimeError(code) from None
+
+    def _remaining_tokens(self) -> int | None:
+        limit = self.task.budget.max_total_tokens
+        return None if limit is None else limit - self.usage.get("total_tokens", 0)
 
     def _charge(self, **draw: int) -> None:
         if any(amount > self._remaining(name) for name, amount in draw.items()):
@@ -425,9 +474,23 @@ class Coordinator:
                             budget_delta={"model_calls": 1}, context_projection_ref=ref,
                             sampling_parameters=self.metadata.get("sampling_parameters", {}),
                             registered_tool_set_version=checksum(tools), **metadata)
-                turn = self.provider.generate(projection, tools, self.task.output_schema, {
-                    "context_projection_ref": ref, "budget": self.task.budget,
-                    "budget_usage": freeze_json(self.usage)})
+                limits = {"context_projection_ref": ref, "budget": self.task.budget,
+                          "budget_usage": freeze_json(self.usage),
+                          "remaining_model_calls": int(self._remaining("model_calls")),
+                          "remaining_total_tokens": self._remaining_tokens()}
+                try:
+                    reply = self.provider.generate(projection, tools,
+                                                   self.task.output_schema, limits)
+                except ProviderError as exc:
+                    self._provider_failure(exc)
+                except Exception as exc:
+                    # Upstream text may echo keys or user content: keep the type only.
+                    raise RuntimeError(_provider_raised(exc)) from None
+                if isinstance(reply, ProviderResponse):
+                    self._account(reply.usage)
+                    turn = reply.turn
+                else:
+                    turn = reply
                 if not isinstance(turn, ModelTurn):
                     raise Denied("provider returned non-ModelTurn output")
                 self._event("MODEL_OUTPUT", "RETURNED", outputs=turn)

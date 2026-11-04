@@ -405,12 +405,51 @@ Summaries are for human display; they are not sufficient evidence for replay/lea
 Core runtime depends on an internal model interface rather than one provider SDK:
 
 ```text
-generate(context_projection, tool_specs, output_schema, limits) -> ModelTurn
+generate(context_projection, tool_specs, output_schema, limits)
+  -> ModelTurn | ProviderResponse
 ```
 
 A deterministic fake provider is mandatory for tests and MUST be able to emit each `ModelTurn` action variant plus model-proposed state updates.
 
 Provider-specific message objects must not appear in public runtime contracts.
+
+### Provider usage and errors (B5.1, issue #6)
+
+A real provider reports what a call cost alongside the turn:
+
+```text
+ProviderResponse
+  turn: ModelTurn
+  usage: ModelUsage
+
+ModelUsage
+  attempts            # every provider request, retries included; >= 1
+  retry_reasons[]     # error codes, exactly one per retried attempt (attempts - 1)
+  prompt_tokens?      # None = not reported; never read as zero
+  completion_tokens?
+  total_tokens?
+  finish_reason?      # stop | length | tool_calls | content_filter | other
+  latency_seconds
+```
+
+`ModelUsage` holds codes and numbers only. An adapter maps an unlisted provider finish reason to `other`, so provider text never enters the trace through usage.
+
+A bare `ModelTurn` (the fake provider) means usage is unknown.
+
+`limits` passed to `generate` carries `context_projection_ref`, `budget`, `budget_usage`, `remaining_model_calls` (after this call's own charge) and `remaining_total_tokens` (None when the task is not token-metered). An adapter caps its retries with `remaining_model_calls`.
+
+Coordinator handling:
+
+- The Coordinator charges one model call before `generate`. Reported usage charges `attempts - 1` more and is traced as a `MODEL_USAGE` event between `MODEL_TURN` and `MODEL_OUTPUT` (`budget_delta` holds the extra model calls; `latency` is set).
+- Reported attempts beyond the remaining model-call budget end the run FAILED with `PROVIDER_USAGE_OVER_BUDGET`. The reported spend is still charged and traced (`MODEL_USAGE` status `OVER_BUDGET`), so `budget_usage` may exceed the limit and shows what was actually used.
+- Provider errors carry optional usage for the attempts made before the failure; the Coordinator charges and traces it the same way before acting on the error.
+- `ProviderOutputError(code)`: a reply arrived but is not a valid turn. The turn is rejected (`MODEL_REJECTION`), the code goes back to the model as runtime feedback, and the model call stays consumed, so repeated malformed output ends EXHAUSTED. Adapters do not retry output errors.
+- `ProviderTransportError(code)`, or the base `ProviderError(code)`: no usable reply after the adapter's retry policy. The run ends FAILED with the code as its error.
+- Any other exception from `generate`, or a provider error whose code fails the format check, ends the run FAILED with `PROVIDER_ERROR: provider raised <type name>`. Its text is dropped because upstream text can echo keys or user content.
+
+Error codes match `[A-Z][A-Z0-9_]*` and are at most 64 characters. The Coordinator reads only the code, never `str(exc)`, and re-checks its format, so an adapter subclass cannot carry text into results or trace. The fake provider ends an exhausted script with `ProviderTransportError("FAKE_PROVIDER_EXHAUSTED")`.
+
+Token-metered tasks (`max_total_tokens` set) still fail closed before any provider call. Token accounting is B5.4 (issue #9).
 
 ## Main Agent authority
 

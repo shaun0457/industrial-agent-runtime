@@ -10,8 +10,10 @@ from .serialization import canonical_json, checksum, to_jsonable
 from .trace import TraceRecorder
 from .actions import Action, FinishProposal, ModelTurn, ToolCallRequest, WorkBatch, WorkItem
 from .coordinator import Coordinator
-from .hooks import (Executor, GateDecision, ModelProvider, RequestGate,
-                    ResultIngestor, ResultVerifier)
+from .hooks import (FINISH_REASONS, Executor, GateDecision, ModelProvider, ModelUsage,
+                    ProviderError, is_error_code,
+                    ProviderOutputError, ProviderResponse, ProviderTransportError,
+                    RequestGate, ResultIngestor, ResultVerifier)
 from .provider import FakeProvider
 from .gates import (DEFAULT_POLICY, ApprovalHook, FrozenRequest, GateDenied, GatePipeline,
                     GatePolicy, GateStage, Reconciliation, ReferenceStateGuard,
@@ -27,7 +29,9 @@ __all__ = [
     "TaskStateStore", "TaskStatus", "ToolResult", "ToolSpec", "Visibility",
     "TraceEvent", "TraceRecorder", "canonical_json", "checksum", "to_jsonable",
     "Action", "Coordinator", "Executor", "FakeProvider", "FinishProposal", "GateDecision",
-    "ModelProvider", "ModelTurn", "RequestGate", "ResultIngestor", "ResultVerifier",
+    "FINISH_REASONS", "is_error_code",
+    "ModelProvider", "ModelTurn", "ModelUsage", "ProviderError", "ProviderOutputError",
+    "ProviderResponse", "ProviderTransportError", "RequestGate", "ResultIngestor", "ResultVerifier",
     "ToolCallRequest", "WorkBatch", "WorkItem",
     "DEFAULT_POLICY", "ApprovalHook", "FrozenRequest", "GateDenied", "GatePipeline",
     "GatePolicy", "GateStage", "Reconciliation", "ReferenceStateGuard",
